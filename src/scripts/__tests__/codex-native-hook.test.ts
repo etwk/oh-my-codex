@@ -3222,16 +3222,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
       const hookSpecificOutput = (result.outputJson as { hookSpecificOutput?: Record<string, unknown> })
@@ -3542,16 +3541,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3577,16 +3575,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3612,16 +3609,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3647,16 +3643,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3682,16 +3677,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3717,16 +3711,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3752,16 +3745,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3787,16 +3779,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3822,16 +3813,15 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Add a blank line after the subject before the narrative body.",
           "- Add a narrative body paragraph explaining the decision context.",
           "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
         ].join("\n"),
       });
     } finally {
@@ -3857,12 +3847,12 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
           "- Use inline `git commit -m ...` paragraphs for Lore-format commits in this path; file/editor/reuse/fixup message sources are not inspectable safely from pre-tool-use enforcement.",
         ].join("\n"),
       });
@@ -3871,22 +3861,81 @@ exit 0
     }
   });
 
-  it("blocks PreToolUse git commit when Lore trailers exist but the OmX co-author trailer is missing", async () => {
-    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-missing-omx-coauthor-"));
+  it("allows PreToolUse git commit when Lore trailers exist without an OmX co-author trailer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-no-omx-coauthor-"));
     try {
       const result = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
           cwd,
           tool_name: "Bash",
-          tool_use_id: "tool-git-commit-missing-omx-coauthor",
+          tool_use_id: "tool-git-commit-no-omx-coauthor",
           tool_input: {
             command: [
               'git commit',
               '-m "Prevent invalid history from bypassing Lore enforcement"',
-              '-m "The native pre-tool-use hook now blocks inline git commit messages that skip Lore trailers or the required OmX co-author trailer."',
+              '-m "The native pre-tool-use hook now blocks inline git commit messages that skip Lore trailers."',
               '-m "Constraint: Native PreToolUse can only inspect the Bash command text"',
               '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
+            ].join(" "),
+          },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows PreToolUse git commit with Lore trailers followed by optional commit footers", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-optional-footers-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-optional-footers",
+          tool_input: {
+            command: [
+              'git commit',
+              '-m "Preserve fork commit policy"',
+              '-m "Keep ordinary Git footers compatible with Lore enforcement."',
+              '-m "Constraint: Native PreToolUse can only inspect the Bash command text"',
+              '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
+              '-m "Signed-off-by: Test User <test@example.com>"',
+              '-m "Co-authored-by: Other User <other@example.com>"',
+            ].join(" "),
+          },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps optional commit footers from satisfying the Lore trailer requirement alone", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-footer-no-lore-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-footer-no-lore",
+          tool_input: {
+            command: [
+              'git commit',
+              '-m "Preserve fork commit policy"',
+              '-m "Keep ordinary Git footers compatible with Lore enforcement."',
+              '-m "Co-authored-by: Other User <other@example.com>"',
             ].join(" "),
           },
         },
@@ -3897,13 +3946,13 @@ exit 0
       assert.deepEqual(result.outputJson, {
         decision: "block",
         reason:
-          "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
         hookSpecificOutput: {
           hookEventName: "PreToolUse",
         },
         systemMessage: [
-          "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
-          "- Add the required co-author trailer: `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
         ].join("\n"),
       });
     } finally {
@@ -3911,7 +3960,46 @@ exit 0
     }
   });
 
-  it("stays silent on PreToolUse for Lore-compliant git commit with OmX co-author trailer", async () => {
+  it("does not treat generic footer-like lines as commit footers", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-generic-footer-"));
+    try {
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          tool_name: "Bash",
+          tool_use_id: "tool-git-commit-generic-footer",
+          tool_input: {
+            command: [
+              'git commit',
+              '-m "Preserve fork commit policy"',
+              '-m "This body is intentionally followed by an unsupported footer-like line."',
+              '-m "Bug: 1234"',
+            ].join(" "),
+          },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.omxEventName, "pre-tool-use");
+      assert.deepEqual(result.outputJson, {
+        decision: "block",
+        reason:
+          "git commit is blocked until the inline commit message satisfies the Lore format.",
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+        },
+        systemMessage: [
+          "git commit is blocked until the inline commit message follows the Lore protocol.",
+          "- Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.",
+        ].join("\n"),
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("stays silent on PreToolUse for Lore-compliant git commit", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-pretool-git-commit-valid-"));
     try {
       const result = await dispatchCodexNativeHook(
@@ -3924,10 +4012,9 @@ exit 0
             command: [
               'git commit',
               '-m "Prevent invalid history from bypassing Lore enforcement"',
-              '-m "The native pre-tool-use hook now blocks inline git commit messages that skip Lore trailers or the required OmX co-author trailer."',
+              '-m "The native pre-tool-use hook now blocks inline git commit messages that skip Lore trailers."',
               '-m "Constraint: Native PreToolUse can only inspect the Bash command text"',
               '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
-              '-m "Co-authored-by: OmX <omx@oh-my-codex.dev>"',
             ].join(" "),
           },
         },
@@ -3968,7 +4055,6 @@ exit 0
               '-m "Update the stop hook internals without refreshing the operator docs yet."',
               '-m "Constraint: native hook warning MVP must remain non-blocking on commit path"',
               '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
-              '-m "Co-authored-by: OmX <omx@oh-my-codex.dev>"',
             ].join(" "),
           },
         },
@@ -4014,7 +4100,6 @@ exit 0
               '-m "Update the stop hook internals and refresh the native hook docs together."',
               '-m "Constraint: native hook warning MVP must remain non-blocking on commit path"',
               '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
-              '-m "Co-authored-by: OmX <omx@oh-my-codex.dev>"',
             ].join(" "),
           },
         },
@@ -4062,7 +4147,6 @@ exit 0
               '-m "Document-refresh check should not inspect the caller cwd when commit targets another repo."',
               '-m "Constraint: alternate git targets are skipped unless hook-side repo resolution is added explicitly"',
               '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
-              '-m "Co-authored-by: OmX <omx@oh-my-codex.dev>"',
             ].join(" "),
           },
         },
@@ -4103,7 +4187,6 @@ exit 0
               '-m "Constraint: native hook warning MVP must remain non-blocking on commit path"',
               `-m "${DOCUMENT_REFRESH_EXEMPTION_PREFIX} internal-only behavior verified"`,
               '-m "Tested: node --test dist/scripts/__tests__/codex-native-hook.test.js"',
-              '-m "Co-authored-by: OmX <omx@oh-my-codex.dev>"',
             ].join(" "),
           },
         },

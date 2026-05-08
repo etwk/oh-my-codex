@@ -220,8 +220,6 @@ const LORE_TRAILER_PREFIXES = [
   "Related:",
 ] as const;
 
-const OMX_COAUTHOR_TRAILER = "Co-authored-by: OmX <omx@oh-my-codex.dev>";
-
 function isDoubleQuotedShellEscapeTarget(char: string | undefined): boolean {
   return char === "\"" || char === "\\" || char === "$" || char === "`" || char === "\n";
 }
@@ -728,9 +726,16 @@ function buildEffectiveLoreCommitGuardEnv(parsed: GitCommitCommandParseResult): 
   return effectiveEnvironment;
 }
 
-function isLoreTrailerLine(line: string): boolean {
-  return line === OMX_COAUTHOR_TRAILER
-    || LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix));
+const OPTIONAL_COMMIT_FOOTER_PREFIXES = [
+  "Acked-by:",
+  "Co-authored-by:",
+  "Reviewed-by:",
+  "Signed-off-by:",
+] as const;
+
+function isCommitFooterLine(line: string): boolean {
+  return LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix))
+    || OPTIONAL_COMMIT_FOOTER_PREFIXES.some((prefix) => line.startsWith(prefix));
 }
 
 function splitParagraphs(text: string): string[] {
@@ -753,7 +758,7 @@ function splitBodyAndTrailerLines(text: string): {
       .split("\n")
       .map((line) => line.trim())
       .filter(Boolean);
-    if (lines.length === 0 || !lines.every((line) => isLoreTrailerLine(line))) break;
+    if (lines.length === 0 || !lines.every((line) => isCommitFooterLine(line))) break;
     trailerStart -= 1;
   }
 
@@ -777,7 +782,7 @@ function buildGitCommitComplianceErrors(message: string | null): string[] {
   const normalized = message.replace(/\r\n?/g, "\n").trim();
   if (!normalized) {
     return [
-      "Provide a non-empty Lore-format commit message with an intent-first subject, narrative body, Lore trailers, and the OmX co-author trailer.",
+      "Provide a non-empty Lore-format commit message with an intent-first subject, narrative body, and Lore trailers.",
     ];
   }
 
@@ -797,10 +802,6 @@ function buildGitCommitComplianceErrors(message: string | null): string[] {
   if (!trailerLines.some((line) => LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix)))) {
     errors.push("Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.");
   }
-  if (!trailerLines.includes(OMX_COAUTHOR_TRAILER)) {
-    errors.push(`Add the required co-author trailer: \`${OMX_COAUTHOR_TRAILER}\`.`);
-  }
-
   return errors;
 }
 
@@ -821,12 +822,12 @@ function buildGitCommitEnforcementOutput(commandText: string): Record<string, un
   return {
     decision: "block",
     reason:
-      "git commit is blocked until the inline commit message satisfies the Lore format and includes the required OmX co-author trailer.",
+      "git commit is blocked until the inline commit message satisfies the Lore format.",
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
     },
     systemMessage: [
-      "git commit is blocked until the inline commit message follows the Lore protocol and includes `Co-authored-by: OmX <omx@oh-my-codex.dev>`.",
+      "git commit is blocked until the inline commit message follows the Lore protocol.",
       ...errors.map((error) => `- ${error}`),
     ].join("\n"),
   };
