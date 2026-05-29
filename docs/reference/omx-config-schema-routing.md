@@ -38,10 +38,11 @@ Current code recognizes these top-level `.omx-config.json` keys:
 
 `notifications` supports the following current shapes:
 
-- Global fields: `enabled`, `verbosity` (`verbose`, `agent`, `session`, or `minimal`), `defaultProfile`, `profiles`, `events`, `hookTemplates`, `reply`, `dispatchCooldownSeconds`, and `idleCooldownSeconds`.
+- Global fields: `enabled`, `verbosity` (`verbose`, `agent`, `session`, or `minimal`), `includeChildAgents`, `defaultProfile`, `profiles`, `events`, `hookTemplates`, `reply`, `dispatchCooldownSeconds`, and `idleCooldownSeconds`.
 - Platform fields: `discord`, `discord-bot`, `telegram`, `slack`, `webhook`.
 - OpenClaw/custom transport fields: `openclaw`, `custom_webhook_command`, and `custom_cli_command`.
-- Event keys under `events`: `session-start`, `session-stop`, `session-end`, `session-idle`, and `ask-user-question`. Each event can set `enabled`, `messageTemplate`, and platform overrides.
+- Event keys under top-level `notifications.events`: `session-start`, `session-stop`, `session-end`, `session-idle`, and `ask-user-question`. Each event can set `enabled`, `messageTemplate`, and platform overrides; per-platform blocks such as `notifications.telegram` do not own an `events` filter.
+- Native child-agent/subagent lifecycle hook dispatches are suppressed at `minimal`/`session` verbosity by default. Set `notifications.verbosity` to `agent`/`verbose`, or set `notifications.includeChildAgents: true`, to receive independent child-agent start/finish hook events.
 - `hookTemplates` supports `version`, `enabled`, `events`, and `defaultTemplate`; per-event template config supports `enabled`, `template`, and platform template overrides.
 - `reply` supports `enabled`, `authorizedDiscordUserIds`, `pollIntervalMs`, `rateLimitPerMinute`, `maxMessageLength`, and `includePrefix`.
 - `notifications.openclaw` supports `enabled`, `gateways`, and `hooks`. Gateway entries are HTTP (`type`, `url`, `headers`, `method`, `timeout`) or command (`type`, `command`, `timeout`). Hook entries use `gateway`, `instruction`, and `enabled`.
@@ -86,6 +87,16 @@ Supported model-related keys:
 | `OMX_TEAM_CHILD_MODEL` | Default child model for specific team-child paths that read this setting directly. |
 
 `readConfiguredEnvOverrides()` also passes through other non-empty string values from `env` for launch helpers such as `omx explore` and `omx sparkshell`. Treat those as advanced environment overrides, not a schema for per-role model routing.
+
+For `omx sparkshell`, the documented helper-specific environment keys are:
+
+| Key | Purpose |
+| --- | --- |
+| `OMX_SPARKSHELL_BIN` | Override the native `omx-sparkshell` binary path. |
+| `OMX_SPARKSHELL_MODEL` | Override the primary summary model. |
+| `OMX_SPARKSHELL_FALLBACK_MODEL` | Override the retry summary model when the primary model is unavailable. |
+| `OMX_SPARKSHELL_MODEL_INSTRUCTIONS_FILE` | Override the packaged lightweight summary instructions file. |
+| `OMX_SPARKSHELL_SUMMARY_TIMEOUT_MS` | Override the local API summary timeout in milliseconds. |
 
 ### `models`
 

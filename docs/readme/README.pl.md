@@ -9,7 +9,7 @@
 [![npm version](https://img.shields.io/npm/v/oh-my-codex)](https://www.npmjs.com/package/oh-my-codex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
-[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/PUwSMR9XNk)
+[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sj4exxQ9v)
 
 **Strona:** https://yeachan-heo.github.io/oh-my-codex-website/
 **Dokumentacja:** [Pierwsze kroki](../getting-started.html) · [Agenty](../agents.html) · [Skille](../skills.html) · [Integracje](../integrations.html) · [Demo](../../DEMO.md) · [Przewodnik po OpenClaw](../openclaw-integration.md)
@@ -26,10 +26,21 @@ Codex zostaje silnikiem, który wykonuje pracę. OMX daje mu lepszy kontekst, go
 
 Jeśli chcesz po prostu zacząć:
 
+Wybierz jedną ścieżkę instalacji. Jeśli Codex CLI jest już zainstalowany (na przykład przez Homebrew):
+
 ```bash
-npm install -g @openai/codex oh-my-codex
+codex --version
+npm install -g oh-my-codex
 omx setup
 omx --madmax --high
+```
+
+Jeśli Codex CLI nie jest zainstalowany i chcesz, aby zarządzał nim npm:
+
+```bash
+npm install -g @openai/codex
+npm install -g oh-my-codex
+omx setup
 ```
 
 Potem pracuj normalnie w Codexie:
@@ -56,7 +67,7 @@ Jeśli chcesz czystego Codexa bez żadnych dodatków, OMX pewnie nie jest dla Ci
 ### Wymagania
 
 - Node.js 20+
-- Codex CLI: `npm install -g @openai/codex`
+- Codex CLI sprawdzony przez `codex --version` (Homebrew albo npm)
 - Skonfigurowane uwierzytelnianie Codex
 - `tmux` na macOS/Linux — jeśli planujesz używać trybu zespołowego
 - `psmux` na natywnym Windows — jeśli planujesz używać trybu zespołowego

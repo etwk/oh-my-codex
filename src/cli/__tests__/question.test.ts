@@ -22,10 +22,42 @@ async function makeRepo(): Promise<string> {
   return cwd;
 }
 
+function makeQuestionCliEnv(cwd: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...overrides, OMX_ROOT: cwd };
+  delete env.OMX_STATE_ROOT;
+  delete env.OMX_TEAM_STATE_ROOT;
+  return env;
+}
+
 afterEach(async () => {
   process.exitCode = originalProcessExitCode;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
+
+async function waitForQuestionRecordFile(
+  questionsDir: string,
+  diagnostics: () => string,
+  options: { attempts?: number; intervalMs?: number } = {},
+): Promise<string> {
+  const attempts = options.attempts ?? 250;
+  const intervalMs = options.intervalMs ?? 20;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const entries = await readdir(questionsDir);
+    const recordFile = entries.find((entry) => entry.endsWith('.json')) || '';
+    if (recordFile) return recordFile;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  assert.fail(`expected question record file, ${diagnostics()}`);
+}
+
+async function waitForQuestionRenderer(recordPath: string): Promise<Awaited<ReturnType<typeof readQuestionRecord>>> {
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    const record = await readQuestionRecord(recordPath);
+    if (record?.renderer) return record;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return readQuestionRecord(recordPath);
+}
 
 describe('omx question CLI', () => {
   beforeEach(() => {
@@ -42,7 +74,7 @@ describe('omx question CLI', () => {
         allow_other: true,
       }), '--json'], {
         cwd,
-        env: { ...process.env, OMX_TEAM_WORKER: 'demo/worker-1', OMX_AUTO_UPDATE: '0' },
+        env: makeQuestionCliEnv(cwd, { OMX_TEAM_WORKER: 'demo/worker-1', OMX_AUTO_UPDATE: '0' }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -71,7 +103,7 @@ describe('omx question CLI', () => {
 
     const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
       cwd,
-      env: { ...process.env, OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' },
+      env: makeQuestionCliEnv(cwd, { OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -82,22 +114,11 @@ describe('omx question CLI', () => {
     const closePromise = new Promise<number | null>((resolve) => child.on('close', resolve));
 
     const questionsDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions');
-    let recordFile = '';
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      try {
-        const { readdir } = await import('node:fs/promises');
-        const entries = await readdir(questionsDir);
-        recordFile = entries.find((entry) => entry.endsWith('.json')) || '';
-        if (recordFile) break;
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-
-    assert.notEqual(recordFile, '', `expected question record file, stderr=${stderr}`);
+    const recordFile = await waitForQuestionRecordFile(questionsDir, () => `stderr=${stderr}; stdout=${stdout}`);
     const recordPath = join(questionsDir, recordFile);
 
     let record = null;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < 250; attempt += 1) {
       record = await readQuestionRecord(recordPath);
       if (record?.status === 'prompting') break;
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -123,6 +144,107 @@ describe('omx question CLI', () => {
     assert.equal(payload.prompt.type, 'multi-answerable');
   });
 
+  it('bridges active autopilot deep-interview questions into waiting-for-user state until answered', async () => {
+    const cwd = await makeRepo();
+    const sessionDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q');
+    const autopilotPath = join(sessionDir, 'autopilot-state.json');
+    await writeFile(autopilotPath, JSON.stringify({
+      mode: 'autopilot',
+      active: true,
+      current_phase: 'deep-interview',
+      run_outcome: 'interviewing',
+      lifecycle_outcome: 'running',
+      session_id: 'sess-q',
+    }, null, 2));
+    await writeFile(join(sessionDir, 'deep-interview-state.json'), JSON.stringify({
+      mode: 'deep-interview',
+      active: true,
+      current_phase: 'intent-first',
+      session_id: 'sess-q',
+    }, null, 2));
+    await writeFile(join(sessionDir, 'skill-active-state.json'), JSON.stringify({
+      active: true,
+      skill: 'autopilot',
+      phase: 'deep-interview',
+      session_id: 'sess-q',
+      active_skills: [{ skill: 'autopilot', phase: 'deep-interview', active: true, session_id: 'sess-q' }],
+    }, null, 2));
+
+    const input = JSON.stringify({
+      question: 'Which provenance rule?',
+      options: [{ label: 'Exact page mapping', value: 'exact-page' }],
+      allow_other: false,
+      source: 'deep-interview',
+      session_id: 'sess-q',
+    });
+
+    const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
+      cwd,
+      env: makeQuestionCliEnv(cwd, {
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+        OMX_QUESTION_TEST_RENDERER: 'noop',
+      }),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const closePromise = new Promise<number | null>((resolve) => child.on('close', resolve));
+
+    const questionsDir = join(sessionDir, 'questions');
+    const recordFile = await waitForQuestionRecordFile(questionsDir, () => `stderr=${stderr}; stdout=${stdout}`);
+    const recordPath = join(questionsDir, recordFile);
+
+    let record = null;
+    for (let attempt = 0; attempt < 250; attempt += 1) {
+      record = await readQuestionRecord(recordPath);
+      if (record?.status === 'prompting') break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(record?.status, 'prompting', `expected prompting question record, stderr=${stderr}`);
+
+    const waitingAutopilot = JSON.parse(await readFile(autopilotPath, 'utf-8')) as {
+      current_phase?: string;
+      run_outcome?: string;
+      lifecycle_outcome?: string;
+      state?: { deep_interview_question?: { status?: string; previous_phase?: string } };
+    };
+    assert.equal(waitingAutopilot.current_phase, 'waiting-for-user');
+    assert.equal(waitingAutopilot.run_outcome, 'blocked_on_user');
+    assert.equal(waitingAutopilot.lifecycle_outcome, 'askuserQuestion');
+    assert.equal(waitingAutopilot.state?.deep_interview_question?.status, 'waiting_for_user');
+    assert.equal(waitingAutopilot.state?.deep_interview_question?.previous_phase, 'deep-interview');
+
+    await markQuestionAnswered(recordPath, {
+      kind: 'option',
+      value: 'exact-page',
+      selected_labels: ['Exact page mapping'],
+      selected_values: ['exact-page'],
+    });
+
+    const exitCode = await closePromise;
+    assert.equal(exitCode, 0, stderr || stdout);
+
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.ok, true);
+    assert.equal(payload.answer.value, 'exact-page');
+
+    const finalAutopilot = JSON.parse(await readFile(autopilotPath, 'utf-8')) as {
+      current_phase?: string;
+      run_outcome?: string;
+      lifecycle_outcome?: string;
+      state?: { deep_interview_question?: { status?: string } };
+    };
+    assert.equal(finalAutopilot.current_phase, 'deep-interview');
+    assert.equal(finalAutopilot.run_outcome, 'interviewing');
+    assert.equal(finalAutopilot.lifecycle_outcome, 'running');
+    assert.equal(finalAutopilot.state?.deep_interview_question?.status, 'satisfied');
+  });
+
   it('omits legacy prompt and answer projections for batch payloads', async () => {
     const cwd = await makeRepo();
     const input = JSON.stringify({
@@ -136,7 +258,7 @@ describe('omx question CLI', () => {
 
     const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
       cwd,
-      env: { ...process.env, OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' },
+      env: makeQuestionCliEnv(cwd, { OMX_AUTO_UPDATE: '0', OMX_NOTIFY_FALLBACK: '0', OMX_HOOK_DERIVED_SIGNALS: '0', OMX_QUESTION_TEST_RENDERER: 'noop' }),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -147,21 +269,11 @@ describe('omx question CLI', () => {
     const closePromise = new Promise<number | null>((resolve) => child.on('close', resolve));
 
     const questionsDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions');
-    let recordFile = '';
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      try {
-        const entries = await readdir(questionsDir);
-        recordFile = entries.find((entry) => entry.endsWith('.json')) || '';
-        if (recordFile) break;
-      } catch {}
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-
-    assert.notEqual(recordFile, '', `expected batch question record file, stderr=${stderr}`);
+    const recordFile = await waitForQuestionRecordFile(questionsDir, () => `stderr=${stderr}; stdout=${stdout}`);
     const recordPath = join(questionsDir, recordFile);
 
     let record = null;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
+    for (let attempt = 0; attempt < 250; attempt += 1) {
       record = await readQuestionRecord(recordPath);
       if (record?.status === 'prompting') break;
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -219,8 +331,7 @@ esac
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
         cwd,
-        env: {
-          ...process.env,
+        env: makeQuestionCliEnv(cwd, {
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           TMUX: '/tmp/fake',
           TMUX_PANE: '%0',
@@ -229,7 +340,7 @@ esac
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
-        },
+        }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -294,8 +405,7 @@ esac
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
         cwd,
-        env: {
-          ...process.env,
+        env: makeQuestionCliEnv(cwd, {
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           TMUX: '/tmp/fake',
           TMUX_PANE: '%0',
@@ -305,7 +415,7 @@ esac
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
           OMX_QUESTION_WAIT_TIMEOUT_MS: '5000',
-        },
+        }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -342,14 +452,13 @@ esac
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
         cwd,
-        env: {
-          ...process.env,
+        env: makeQuestionCliEnv(cwd, {
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
           OMX_QUESTION_TEST_RENDERER: 'noop',
           OMX_QUESTION_WAIT_TIMEOUT_MS: '50',
-        },
+        }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -383,13 +492,12 @@ exit 0
       session_id: 'sess-q',
     });
 
-    const childEnv: NodeJS.ProcessEnv = {
-      ...process.env,
+    const childEnv: NodeJS.ProcessEnv = makeQuestionCliEnv(cwd, {
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       OMX_AUTO_UPDATE: '0',
       OMX_NOTIFY_FALLBACK: '0',
       OMX_HOOK_DERIVED_SIGNALS: '0',
-    };
+    });
     delete childEnv.TMUX;
     delete childEnv.TMUX_PANE;
     delete childEnv.OMX_QUESTION_RETURN_PANE;
@@ -463,8 +571,7 @@ exit 0
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       const child = spawn(process.execPath, [omxBin, 'question', '--input', input, '--json'], {
         cwd,
-        env: {
-          ...process.env,
+        env: makeQuestionCliEnv(cwd, {
           PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
           TMUX: '/tmp/fake',
           TMUX_PANE: '%0',
@@ -473,7 +580,7 @@ exit 0
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
-        },
+        }),
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';
@@ -532,14 +639,13 @@ esac
       session_id: 'sess-q',
     });
 
-    const childEnv: NodeJS.ProcessEnv = {
-      ...process.env,
+    const childEnv: NodeJS.ProcessEnv = makeQuestionCliEnv(cwd, {
       PATH: `${fakeBinDir}:${process.env.PATH || ''}`,
       OMX_QUESTION_RETURN_PANE: '%44',
       OMX_AUTO_UPDATE: '0',
       OMX_NOTIFY_FALLBACK: '0',
       OMX_HOOK_DERIVED_SIGNALS: '0',
-    };
+    });
     delete childEnv.TMUX;
     delete childEnv.TMUX_PANE;
     delete childEnv.OMX_LEADER_PANE_ID;
@@ -557,31 +663,27 @@ esac
     const closePromise = new Promise<number | null>((resolve) => child.on('close', resolve));
 
     const questionsDir = join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions');
-    let recordFile = '';
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      const entries = await readdir(questionsDir);
-      recordFile = entries.find((entry) => entry.endsWith('.json')) || '';
-      if (recordFile) break;
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    assert.notEqual(recordFile, '', `expected question record file, stderr=${stderr}`);
+    const recordFile = await waitForQuestionRecordFile(questionsDir, () => `stderr=${stderr}; stdout=${stdout}`);
     const recordPath = join(questionsDir, recordFile);
 
-    let record = await readQuestionRecord(recordPath);
-    for (let attempt = 0; attempt < 100 && !record?.renderer; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      record = await readQuestionRecord(recordPath);
-    }
+    const record = await waitForQuestionRenderer(recordPath);
     assert.equal(record?.renderer?.renderer, 'tmux-pane');
     assert.equal(record?.renderer?.target, '%45');
     assert.equal(record?.renderer?.return_target, '%44');
 
+    const injectedAnswers: Array<{ paneId: string; answer: string | string[] | undefined }> = [];
     await markQuestionAnswered(recordPath, {
       kind: 'option',
       value: 'a',
       selected_labels: ['A'],
       selected_values: ['a'],
+    }, {
+      injectAnswersToPane: (paneId, answers) => {
+        injectedAnswers.push({ paneId, answer: answers[0]?.answer.value ?? '' });
+        return true;
+      },
     });
+    assert.deepEqual(injectedAnswers, [{ paneId: '%44', answer: 'a' }]);
 
     const exitCode = await closePromise;
     assert.equal(exitCode, 0, stderr || stdout);
@@ -609,6 +711,9 @@ esac
     const originalTmuxPane = process.env.TMUX_PANE;
     const originalQuestionReturnPane = process.env.OMX_QUESTION_RETURN_PANE;
     const originalLeaderPaneId = process.env.OMX_LEADER_PANE_ID;
+    const originalOmxRoot = process.env.OMX_ROOT;
+    const originalOmxStateRoot = process.env.OMX_STATE_ROOT;
+    const originalOmxTeamStateRoot = process.env.OMX_TEAM_STATE_ROOT;
     const writes: string[] = [];
     const stderrWrites: string[] = [];
 
@@ -619,6 +724,9 @@ esac
     delete process.env.TMUX_PANE;
     delete process.env.OMX_QUESTION_RETURN_PANE;
     delete process.env.OMX_LEADER_PANE_ID;
+    process.env.OMX_ROOT = cwd;
+    delete process.env.OMX_STATE_ROOT;
+    delete process.env.OMX_TEAM_STATE_ROOT;
     process.stdin.setRawMode = ((_: boolean) => process.stdin) as unknown as typeof process.stdin.setRawMode;
     process.stdin.resume = (() => process.stdin) as unknown as typeof process.stdin.resume;
     process.stdin.pause = (() => process.stdin) as unknown as typeof process.stdin.pause;
@@ -654,8 +762,8 @@ esac
       const payload = JSON.parse(joined);
       assert.equal(payload.ok, true);
       assert.equal(payload.answer.value, 'a');
-      assert.doesNotMatch(joined, /Use ↑\/↓ to move, Enter to select\./);
-      assert.match(stderrJoined, /Use ↑\/↓ to move, Enter to select\./);
+      assert.doesNotMatch(joined, /↑↓ move · Enter select/);
+      assert.match(stderrJoined, /↑↓ move · Enter select/);
 
       const entries = await readdir(join(cwd, '.omx', 'state', 'sessions', 'sess-q', 'questions'));
       assert.equal(entries.length, 1);
@@ -680,6 +788,12 @@ esac
       else delete process.env.OMX_QUESTION_RETURN_PANE;
       if (typeof originalLeaderPaneId === 'string') process.env.OMX_LEADER_PANE_ID = originalLeaderPaneId;
       else delete process.env.OMX_LEADER_PANE_ID;
+      if (typeof originalOmxRoot === 'string') process.env.OMX_ROOT = originalOmxRoot;
+      else delete process.env.OMX_ROOT;
+      if (typeof originalOmxStateRoot === 'string') process.env.OMX_STATE_ROOT = originalOmxStateRoot;
+      else delete process.env.OMX_STATE_ROOT;
+      if (typeof originalOmxTeamStateRoot === 'string') process.env.OMX_TEAM_STATE_ROOT = originalOmxTeamStateRoot;
+      else delete process.env.OMX_TEAM_STATE_ROOT;
     }
   });
 

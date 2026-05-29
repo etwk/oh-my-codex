@@ -102,6 +102,33 @@ const SKILL_PATTERNS = [
   rx('user says `continue`'),
 ];
 
+const ULTRAQA_SKILL_PATTERNS = [
+  ...SKILL_PATTERNS,
+  rx('adversarial dynamic e2e'),
+  rx('not satisfied by a shallow build/lint/typecheck/test checklist|build/lint/typecheck/test.*not sufficient'),
+  rx('malicious/hostile user behavior|hostile user modeling|User/attacker model'),
+  rx('temporary tests.*harnesses|temporary harnesses'),
+  rx('malformed input'),
+  rx('repeated interruptions'),
+  rx('prompt injection'),
+  rx('cancel/resume'),
+  rx('stale state'),
+  rx('dirty worktree'),
+  rx('hung or long-running commands|hung-command'),
+  rx('flaky tests'),
+  rx('misleading success output'),
+  rx('Scenario matrix'),
+  rx('Commands run'),
+  rx('Failures found'),
+  rx('Fixes applied'),
+  rx('Residual risks'),
+  rx('Evidence'),
+  rx('Cleanup and rollback|cleanup/rollback'),
+  rx('No destructive commands|Safety Bounds'),
+  rx('secret exfiltration'),
+  rx('bounded runtimes|No unbounded waits'),
+];
+
 const ULTRAWORK_SKILL_PATTERNS = [
   ...SKILL_PATTERNS,
   rx('Gather enough context before implementation'),
@@ -227,12 +254,21 @@ export const SKILL_CONTRACTS: GuidanceSurfaceContract[] = [
     'ralph',
     'ralplan',
     'team',
-    'ultraqa',
   ].map((name) => ({
     id: name,
     path: `skills/${name}/SKILL.md`,
     requiredPatterns: SKILL_PATTERNS,
   })),
+  {
+    id: 'ultraqa',
+    path: 'skills/ultraqa/SKILL.md',
+    requiredPatterns: ULTRAQA_SKILL_PATTERNS,
+  },
+  {
+    id: 'ultraqa-plugin',
+    path: 'plugins/oh-my-codex/skills/ultraqa/SKILL.md',
+    requiredPatterns: ULTRAQA_SKILL_PATTERNS,
+  },
   {
     id: 'ultrawork',
     path: 'skills/ultrawork/SKILL.md',
@@ -312,17 +348,39 @@ export const PROMPT_REFACTOR_INVARIANT_CONTRACTS: GuidanceSurfaceContract[] = [
   {
     id: 'ultraqa-verification-loop',
     path: 'skills/ultraqa/SKILL.md',
-    requiredPatterns: [rx('test'), rx('verify'), rx('fix'), rx('repeat|loop')],
+    requiredPatterns: [
+      rx('test'),
+      rx('verify'),
+      rx('fix'),
+      rx('repeat|loop'),
+      rx('adversarial dynamic e2e'),
+      rx('Scenario matrix'),
+      rx('malformed input'),
+      rx('prompt injection'),
+      rx('misleading success output'),
+    ],
   },
   {
-    id: 'autopilot-strict-3phase-loop',
+    id: 'autopilot-default-ultragoal-loop',
     path: 'skills/autopilot/SKILL.md',
     requiredPatterns: [
-      rx('\\$ralplan\\s*->\\s*\\$ralph\\s*->\\s*\\$code-review'),
+      rx('\\$deep-interview\\s*->\\s*\\$ralplan\\s*->\\s*\\$ultragoal.*\\$code-review\\s*->\\s*\\$ultraqa'),
       rx('return[s]? to `?\\$ralplan`?|current_phase.*ralplan'),
       rx('review_cycle'),
       rx('review_verdict'),
+      rx('qa_verdict'),
       rx('return_to_ralplan_reason'),
+      rx('ralplan_consensus_gate'),
+      rx('PRD/test-spec files alone are not completion evidence'),
+    ],
+  },
+  {
+    id: 'pipeline-ralplan-consensus-skip-gate',
+    path: 'skills/pipeline/SKILL.md',
+    requiredPatterns: [
+      rx('Skips only when both `prd-\\*\\.md` and `test-spec-\\*\\.md`'),
+      rx('Architect approval followed by Critic approval'),
+      rx('Plan/test-spec files alone are not consensus evidence'),
     ],
   },
   {

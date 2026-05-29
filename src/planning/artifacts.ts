@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import {
   comparePlanningArtifactPaths,
   parsePlanningArtifactFileName,
@@ -7,38 +7,13 @@ import {
   selectLatestPlanningArtifactPath,
   selectMatchingTestSpecsForPrd,
 } from './artifact-names.js';
-import {
-  resolveContextPackHandoffStatus,
-  type ContextPackHandoffStatusSnapshot,
-  type ContextPackRef,
-  type ContextPackRole,
-  type ContextPackStatus,
-} from './context-pack-status.js';
-import { omxPlansDir } from '../utils/paths.js';
+import { collectMarkdownVisibleMatches } from './markdown-structure.js';
 
 const PRD_PATTERN = /^prd-.*\.md$/i;
 const TEST_SPEC_PATTERN = /^test-?spec-.*\.md$/i;
 const DEEP_INTERVIEW_SPEC_PATTERN = /^deep-interview-.*\.md$/i;
 const APPROVED_REPOSITORY_CONTEXT_MAX_CHARS = 4_000;
 const APPROVED_REPOSITORY_CONTEXT_MAX_LINES = 80;
-
-export {
-  REQUIRED_CONTEXT_PACK_ROLES,
-  isApprovedExecutionContextReadyStatus,
-  isApprovedExecutionFollowupReadyStatus,
-  resolveContextPackHandoffState,
-} from './context-pack-status.js';
-export type {
-  ContextPackHandoffStatusSnapshot,
-  ContextPackBaselineState,
-  ContextPackBasisState,
-  ContextPackOutcomeState,
-  ContextPackPackState,
-  ContextPackRef,
-  ContextPackRole,
-  ContextPackRoleCoverageState,
-  ContextPackStatus,
-} from './context-pack-status.js';
 
 interface PlanningArtifactSelectionBase {
   prdPath: string | null;
@@ -64,10 +39,6 @@ export interface ApprovedPlanContext {
   sourcePath: string;
   testSpecPaths: string[];
   deepInterviewSpecPaths: string[];
-  contextPack: ContextPackRef | null;
-  contextPackStatus: ContextPackStatus;
-  missingRequiredContextPackRoles: ContextPackRole[];
-  contextPackIssues: string[];
   repositoryContextSummary?: ApprovedRepositoryContextSummary;
 }
 
@@ -84,16 +55,15 @@ export interface LatestPlanningArtifactSelection {
   prdPath: string | null;
   testSpecPaths: string[];
   deepInterviewSpecPaths: string[];
-  contextPack: ContextPackRef | null;
-  contextPackStatus: ContextPackStatus;
-  missingRequiredContextPackRoles: ContextPackRole[];
-  contextPackIssues: string[];
 }
 
 interface ApprovedExecutionLaunchHintReadOptions {
   prdPath?: string;
   task?: string;
   command?: string;
+  workerCount?: number;
+  agentType?: string;
+  linkedRalph?: boolean;
 }
 
 export type ApprovedExecutionLaunchHintOutcome =
@@ -126,7 +96,7 @@ function readMatchingPaths(dir: string, pattern: RegExp): string[] {
 }
 
 export function readPlanningArtifacts(cwd: string): PlanningArtifacts {
-  const plansDir = omxPlansDir(cwd);
+  const plansDir = join(cwd, '.omx', 'plans');
   const specsDir = join(cwd, '.omx', 'specs');
 
   return {
@@ -173,11 +143,12 @@ function selectPlanningArtifactsBase(
   artifacts: PlanningArtifacts,
   prdPath?: string,
 ): PlanningArtifactSelectionBase {
+  const requestedPrdPath = prdPath == null
+    ? null
+    : resolveRequestedPrdPath(artifacts, prdPath);
   const selectedPrdPath = prdPath == null
     ? selectLatestPlanningArtifactPath(artifacts.prdPaths)
-    : artifacts.prdPaths.includes(prdPath)
-      ? prdPath
-      : null;
+    : requestedPrdPath;
   const slug = selectedPrdPath
     ? planningArtifactSlug(selectedPrdPath, 'prd')
     : null;
@@ -189,19 +160,75 @@ function selectPlanningArtifactsBase(
   };
 }
 
+function resolveRequestedPrdPath(
+  artifacts: PlanningArtifacts,
+  rawPrdPath: string,
+): string | null {
+  const requested = rawPrdPath.trim();
+  if (!requested) {
+    return null;
+  }
+  if (artifacts.prdPaths.includes(requested)) {
+    return requested;
+  }
+
+  const repoRoot = dirname(dirname(artifacts.plansDir));
+  const canonicalByResolvedPath = new Map(
+    artifacts.prdPaths.map((artifactPath) => [resolve(artifactPath), artifactPath]),
+  );
+  const candidatePaths = isAbsolute(requested)
+    ? [resolve(requested)]
+    : [
+      resolveRelativePathWithinRoot(repoRoot, requested, repoRoot),
+      resolveRelativePathWithinRoot(artifacts.plansDir, requested, repoRoot),
+    ];
+
+  for (const candidatePath of candidatePaths) {
+    if (!candidatePath) {
+      continue;
+    }
+    const canonical = canonicalByResolvedPath.get(candidatePath);
+    if (canonical) {
+      return canonical;
+    }
+  }
+  return null;
+}
+
+function resolveRelativePathWithinRoot(
+  baseDir: string,
+  rawPath: string,
+  rootDir: string,
+): string | null {
+  const resolvedRootDir = resolve(rootDir);
+  let currentDir = resolve(baseDir);
+
+  for (const segment of rawPath.split(/[\\/]+/)) {
+    if (!segment || segment === '.') {
+      continue;
+    }
+    if (segment === '..') {
+      if (currentDir === resolvedRootDir) {
+        return null;
+      }
+      const parentDir = dirname(currentDir);
+      if (parentDir === currentDir) {
+        return null;
+      }
+      currentDir = parentDir;
+      continue;
+    }
+    currentDir = join(currentDir, segment);
+  }
+
+  return resolve(currentDir);
+}
+
 function selectPlanningArtifacts(
   artifacts: PlanningArtifacts,
   prdPath?: string,
 ): LatestPlanningArtifactSelection {
-  const selection = selectPlanningArtifactsBase(artifacts, prdPath);
-  const handoffStatus = resolveContextPackHandoffStatus(artifacts, selection);
-  return {
-    ...selection,
-    contextPack: handoffStatus.contextPack,
-    contextPackStatus: handoffStatus.contextPackStatus,
-    missingRequiredContextPackRoles: handoffStatus.missingRequiredContextPackRoles,
-    contextPackIssues: handoffStatus.contextPackIssues,
-  };
+  return selectPlanningArtifactsBase(artifacts, prdPath);
 }
 
 function boundedRepositoryContextSummary(sourcePath: string, content: string): ApprovedRepositoryContextSummary | null {
@@ -259,12 +286,11 @@ function readApprovedRepositoryContextSummary(
 function readApprovedPlanText(
   cwd: string,
   options: ApprovedExecutionLaunchHintReadOptions = {},
-  allowMissingBaseline = false,
+  artifacts: PlanningArtifacts = readPlanningArtifacts(cwd),
 ): { content: string; context: ApprovedPlanContext } | null {
-  const artifacts = readPlanningArtifacts(cwd);
   const selection = selectPlanningArtifacts(artifacts, options.prdPath);
   const latestPrdPath = selection.prdPath;
-  if (!latestPrdPath || (!allowMissingBaseline && selection.testSpecPaths.length === 0) || !existsSync(latestPrdPath)) {
+  if (!latestPrdPath || selection.testSpecPaths.length === 0 || !existsSync(latestPrdPath)) {
     return null;
   }
 
@@ -278,10 +304,6 @@ function readApprovedPlanText(
         sourcePath: latestPrdPath,
         testSpecPaths: selection.testSpecPaths,
         deepInterviewSpecPaths: selection.deepInterviewSpecPaths,
-        contextPack: selection.contextPack,
-        contextPackStatus: selection.contextPackStatus,
-        missingRequiredContextPackRoles: selection.missingRequiredContextPackRoles,
-        contextPackIssues: selection.contextPackIssues,
         ...(repositoryContextSummary ? { repositoryContextSummary } : {}),
       },
     };
@@ -298,14 +320,6 @@ export function selectLatestPlanningArtifacts(
 
 export function readLatestPlanningArtifacts(cwd: string): LatestPlanningArtifactSelection {
   return selectLatestPlanningArtifacts(readPlanningArtifacts(cwd));
-}
-
-export function readContextPackHandoffStatus(
-  cwd: string,
-  prdPath?: string,
-): ContextPackHandoffStatusSnapshot {
-  const artifacts = readPlanningArtifacts(cwd);
-  return resolveContextPackHandoffStatus(artifacts, selectPlanningArtifactsBase(artifacts, prdPath));
 }
 
 function extractTeamDagMarkdownHandoff(content: string): string | null {
@@ -376,32 +390,94 @@ type LaunchHintSelection =
   | { status: 'ambiguous' }
   | { status: 'unique'; match: RegExpMatchArray; task: string };
 
+type LaunchHintMatchFilter = (match: RegExpMatchArray, task: string) => boolean;
+
+const TEAM_LAUNCH_HINT_PATTERN_SOURCE =
+  String.raw`(?<command>(?:omx\s+team|\$team)\s+(?<ralph>ralph\s+)?(?<count>\d+)(?::(?<role>[a-z][a-z0-9-]*))?\s+(?<task>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))`;
+const RALPH_LAUNCH_HINT_PATTERN_SOURCE =
+  String.raw`(?<command>(?:omx\s+ralph|\$ralph)\s+(?<task>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))`;
+
 function launchHintPattern(mode: 'team' | 'ralph'): RegExp {
   return mode === 'team'
-    ? /(?<command>(?:omx\s+team|\$team)\s+(?<ralph>ralph\s+)?(?<count>\d+)(?::(?<role>[a-z][a-z0-9-]*))?\s+(?<task>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))/gi
-    : /(?<command>(?:omx\s+ralph|\$ralph)\s+(?<task>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'))/gi;
+    ? new RegExp(TEAM_LAUNCH_HINT_PATTERN_SOURCE, 'gi')
+    : new RegExp(RALPH_LAUNCH_HINT_PATTERN_SOURCE, 'gi');
+}
+
+function launchHintExactPattern(mode: 'team' | 'ralph'): RegExp {
+  return mode === 'team'
+    ? new RegExp(`^${TEAM_LAUNCH_HINT_PATTERN_SOURCE}$`, 'i')
+    : new RegExp(`^${RALPH_LAUNCH_HINT_PATTERN_SOURCE}$`, 'i');
+}
+
+function normalizeLaunchHintCommandFromMatch(
+  mode: 'team' | 'ralph',
+  match: RegExpMatchArray | null | undefined,
+): string | null {
+  const groups = match?.groups;
+  const rawCommand = groups?.command?.trim();
+  const taskToken = groups?.task?.trim();
+  if (!groups || !rawCommand || !taskToken) {
+    return null;
+  }
+
+  if (mode === 'team') {
+    const countToken = groups.count?.trim();
+    if (!countToken) {
+      return null;
+    }
+    const roleToken = groups.role?.trim();
+    const prefix = /^\$team\b/i.test(rawCommand) ? '$team' : 'omx team';
+    const countWithRole = roleToken ? `${countToken}:${roleToken}` : countToken;
+    const parts = [prefix];
+    if (groups.ralph?.trim()) {
+      parts.push('ralph');
+    }
+    parts.push(countWithRole, taskToken);
+    return parts.join(' ');
+  }
+
+  const prefix = /^\$ralph\b/i.test(rawCommand) ? '$ralph' : 'omx ralph';
+  return `${prefix} ${taskToken}`;
+}
+
+function normalizeLaunchHintCommand(
+  mode: 'team' | 'ralph',
+  command: string | undefined,
+): string | undefined {
+  const trimmed = command?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const parsed = trimmed.match(launchHintExactPattern(mode));
+  return normalizeLaunchHintCommandFromMatch(mode, parsed) ?? trimmed;
 }
 
 function collectLaunchHintMatches(
   content: string,
   mode: 'team' | 'ralph',
 ): RegExpMatchArray[] {
-  return [...content.matchAll(launchHintPattern(mode))];
+  return collectMarkdownVisibleMatches(content, launchHintPattern(mode));
 }
 
 function selectLaunchHintMatch(
+  mode: 'team' | 'ralph',
   matches: RegExpMatchArray[],
   normalizedTask?: string,
   normalizedCommand?: string,
+  matchFilter?: LaunchHintMatchFilter,
 ): LaunchHintSelection {
+  const exactCommand = normalizeLaunchHintCommand(mode, normalizedCommand);
   if (normalizedCommand) {
     const exactMatches = matches.flatMap((match) => {
-      const command = match.groups?.command?.trim();
-      if (!command || command !== normalizedCommand) {
+      const command = normalizeLaunchHintCommandFromMatch(mode, match);
+      if (!command || command !== exactCommand) {
         return [];
       }
       const task = match.groups?.task ? decodeApprovedExecutionQuotedValue(match.groups.task) : null;
-      return task ? [{ match, task }] : [];
+      if (!task) {
+        return [];
+      }
+      return [{ match, task }];
     });
     if (exactMatches.length === 0) return { status: 'no-match' };
     if (exactMatches.length > 1) return { status: 'ambiguous' };
@@ -411,7 +487,13 @@ function selectLaunchHintMatch(
   if (!normalizedTask) {
     const decodedMatches = matches.flatMap((match) => {
       const task = match.groups?.task ? decodeApprovedExecutionQuotedValue(match.groups.task) : null;
-      return task ? [{ match, task }] : [];
+      if (!task) {
+        return [];
+      }
+      if (matchFilter && !matchFilter(match, task)) {
+        return [];
+      }
+      return [{ match, task }];
     });
     if (decodedMatches.length === 0) return { status: 'no-match' };
     if (decodedMatches.length > 1) return { status: 'ambiguous' };
@@ -420,28 +502,121 @@ function selectLaunchHintMatch(
 
   const exactMatches = matches.flatMap((match) => {
     const task = match.groups?.task ? decodeApprovedExecutionQuotedValue(match.groups.task) : null;
-    return task && task.trim() === normalizedTask ? [{ match, task }] : [];
+    if (!task || task.trim() !== normalizedTask) {
+      return [];
+    }
+    if (matchFilter && !matchFilter(match, task)) {
+      return [];
+    }
+    return [{ match, task }];
   });
   if (exactMatches.length === 0) return { status: 'no-match' };
   if (exactMatches.length > 1) return { status: 'ambiguous' };
   return { status: 'unique', ...exactMatches[0]! };
 }
 
-export function readApprovedExecutionLaunchHintOutcome(
+function hasRequestedTeamLaunchSignature(
+  options: ApprovedExecutionLaunchHintReadOptions,
+): boolean {
+  return options.workerCount != null
+    || options.agentType != null
+    || options.linkedRalph != null;
+}
+
+function matchesRequestedTeamLaunchSignature(
+  match: RegExpMatchArray,
+  options: ApprovedExecutionLaunchHintReadOptions,
+): boolean {
+  const groups = match.groups;
+  if (!groups) {
+    return false;
+  }
+
+  if (options.workerCount != null) {
+    const workerCount = Number.parseInt(groups.count ?? '', 10);
+    if (!Number.isFinite(workerCount) || workerCount !== options.workerCount) {
+      return false;
+    }
+  }
+
+  if (options.agentType != null) {
+    const requestedAgentType = options.agentType.trim();
+    const actualAgentType = groups.role?.trim() || '';
+    if (actualAgentType !== requestedAgentType) {
+      return false;
+    }
+  }
+
+  if (options.linkedRalph != null) {
+    if (Boolean(groups.ralph?.trim()) !== options.linkedRalph) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function buildRequestedTeamLaunchSignatureMatchFilter(
+  options: ApprovedExecutionLaunchHintReadOptions,
+): LaunchHintMatchFilter | undefined {
+  if (options.command || !hasRequestedTeamLaunchSignature(options)) {
+    return undefined;
+  }
+  return (match: RegExpMatchArray, _task: string) => matchesRequestedTeamLaunchSignature(match, options);
+}
+
+function sameTeamLaunchSignatureMatch(
+  anchorHint: ApprovedExecutionLaunchHint,
+  match: RegExpMatchArray,
+): boolean {
+  const groups = match.groups;
+  if (!groups) {
+    return false;
+  }
+
+  const workerCount = Number.parseInt(groups.count ?? '', 10);
+  if (!Number.isFinite(workerCount) || workerCount !== anchorHint.workerCount) {
+    return false;
+  }
+
+  const actualAgentType = groups.role?.trim();
+  const expectedAgentType = anchorHint.agentType?.trim();
+  if ((actualAgentType || undefined) !== (expectedAgentType || undefined)) {
+    return false;
+  }
+
+  return Boolean(groups.ralph?.trim()) === Boolean(anchorHint.linkedRalph);
+}
+
+function orderedPrdPathsNewestFirst(prdPaths: readonly string[]): string[] {
+  return [...prdPaths].sort(comparePlanningArtifactPaths).reverse();
+}
+
+function readApprovedExecutionLaunchHintOutcomeForPrdPath(
   cwd: string,
   mode: 'team' | 'ralph',
+  prdPath: string,
   options: ApprovedExecutionLaunchHintReadOptions = {},
+  matchFilter?: LaunchHintMatchFilter,
+  artifacts: PlanningArtifacts = readPlanningArtifacts(cwd),
 ): ApprovedExecutionLaunchHintOutcome {
-  const approvedPlan = readApprovedPlanText(cwd, options, true);
-  if (!approvedPlan) return { status: 'absent' };
-
+  const approvedPlan = readApprovedPlanText(cwd, { ...options, prdPath }, artifacts);
+  if (!approvedPlan) {
+    return { status: 'absent' };
+  }
   const selected = selectLaunchHintMatch(
+    mode,
     collectLaunchHintMatches(approvedPlan.content, mode),
     options.task?.trim(),
     options.command?.trim(),
+    matchFilter,
   );
-  if (selected.status === 'ambiguous') return { status: 'ambiguous' };
-  if (selected.status !== 'unique' || !selected.match.groups) return { status: 'absent' };
+  if (selected.status === 'ambiguous') {
+    return { status: 'ambiguous' };
+  }
+  if (selected.status !== 'unique' || !selected.match.groups) {
+    return { status: 'absent' };
+  }
 
   if (mode === 'team') {
     const workerCount = Number.parseInt(selected.match.groups.count, 10);
@@ -452,7 +627,7 @@ export function readApprovedExecutionLaunchHintOutcome(
       status: 'resolved',
       hint: {
         mode,
-        command: selected.match.groups.command,
+        command: normalizeLaunchHintCommandFromMatch(mode, selected.match) ?? selected.match.groups.command,
         task: selected.task,
         workerCount,
         agentType: selected.match.groups.role || undefined,
@@ -466,11 +641,160 @@ export function readApprovedExecutionLaunchHintOutcome(
     status: 'resolved',
     hint: {
       mode,
-      command: selected.match.groups.command,
+      command: normalizeLaunchHintCommandFromMatch(mode, selected.match) ?? selected.match.groups.command,
       task: selected.task,
       ...approvedPlan.context,
     },
   };
+}
+
+function isApprovedExecutionLaunchHintReady(hint: ApprovedExecutionLaunchHint): boolean {
+  return hint.testSpecPaths.length > 0 && existsSync(hint.sourcePath);
+}
+
+type SameLineageFallback =
+  | { status: 'none' }
+  | { status: 'ambiguous' }
+  | { status: 'resolved'; hint: ApprovedExecutionLaunchHint };
+
+function resolveOlderReusableSameLineageHint(
+  cwd: string,
+  mode: 'team' | 'ralph',
+  artifacts: PlanningArtifacts,
+  latestPrdPath: string,
+  anchorHint: ApprovedExecutionLaunchHint,
+): SameLineageFallback {
+  const orderedPrdPaths = [...artifacts.prdPaths].sort(comparePlanningArtifactPaths);
+  const latestIndex = orderedPrdPaths.lastIndexOf(latestPrdPath);
+  if (latestIndex <= 0) {
+    return { status: 'none' };
+  }
+
+  for (let index = latestIndex - 1; index >= 0; index -= 1) {
+    const prdPath = orderedPrdPaths[index]!;
+    const outcome = readApprovedExecutionLaunchHintOutcomeForPrdPath(
+      cwd,
+      mode,
+      prdPath,
+      { task: anchorHint.task },
+      mode === 'team'
+        ? (match: RegExpMatchArray, _task: string) => sameTeamLaunchSignatureMatch(anchorHint, match)
+        : undefined,
+      artifacts,
+    );
+    if (outcome.status === 'ambiguous') {
+      return { status: 'ambiguous' };
+    }
+    if (outcome.status !== 'resolved') {
+      continue;
+    }
+    if (isApprovedExecutionLaunchHintReady(outcome.hint)) {
+      return { status: 'resolved', hint: outcome.hint };
+    }
+  }
+
+  return { status: 'none' };
+}
+
+export function readApprovedExecutionLaunchHintOutcome(
+  cwd: string,
+  mode: 'team' | 'ralph',
+  options: ApprovedExecutionLaunchHintReadOptions = {},
+): ApprovedExecutionLaunchHintOutcome {
+  const artifacts = readPlanningArtifacts(cwd);
+  if (options.prdPath) {
+    return readApprovedExecutionLaunchHintOutcomeForPrdPath(
+      cwd,
+      mode,
+      options.prdPath,
+      options,
+      mode === 'team' ? buildRequestedTeamLaunchSignatureMatchFilter(options) : undefined,
+      artifacts,
+    );
+  }
+
+  const normalizedTask = options.task?.trim();
+  const normalizedCommand = options.command?.trim();
+  if (!normalizedTask && !normalizedCommand) {
+    const latestPrdPath = selectLatestPlanningArtifactPath(artifacts.prdPaths);
+    if (!latestPrdPath) {
+      return { status: 'absent' };
+    }
+
+    const latestOutcome = readApprovedExecutionLaunchHintOutcomeForPrdPath(
+      cwd,
+      mode,
+      latestPrdPath,
+      options,
+      mode === 'team' ? buildRequestedTeamLaunchSignatureMatchFilter(options) : undefined,
+      artifacts,
+    );
+    if (latestOutcome.status === 'ambiguous') {
+      return { status: 'ambiguous' };
+    }
+    if (latestOutcome.status !== 'resolved') {
+      return { status: 'absent' };
+    }
+    if (isApprovedExecutionLaunchHintReady(latestOutcome.hint)) {
+      return latestOutcome;
+    }
+
+    const fallback = resolveOlderReusableSameLineageHint(
+      cwd,
+      mode,
+      artifacts,
+      latestPrdPath,
+      latestOutcome.hint,
+    );
+    if (fallback.status === 'ambiguous') {
+      return { status: 'ambiguous' };
+    }
+    return fallback.status === 'resolved'
+      ? { status: 'resolved', hint: fallback.hint }
+      : latestOutcome;
+  }
+
+  let newestNonreadyHint: ApprovedExecutionLaunchHint | null = null;
+  let teamLineageAnchorHint: ApprovedExecutionLaunchHint | null = null;
+  for (const prdPath of orderedPrdPathsNewestFirst(artifacts.prdPaths)) {
+    const teamLineageAnchor = teamLineageAnchorHint;
+    const requestedTeamMatchFilter = mode === 'team'
+      ? buildRequestedTeamLaunchSignatureMatchFilter(options)
+      : undefined;
+    const teamLineageMatchFilter = requestedTeamMatchFilter ?? (
+      mode === 'team'
+      && normalizedTask
+      && !normalizedCommand
+      && teamLineageAnchor
+        ? (match: RegExpMatchArray, _task: string) => sameTeamLaunchSignatureMatch(teamLineageAnchor, match)
+        : undefined
+    );
+    const outcome = readApprovedExecutionLaunchHintOutcomeForPrdPath(
+      cwd,
+      mode,
+      prdPath,
+      options,
+      teamLineageMatchFilter,
+      artifacts,
+    );
+    if (outcome.status === 'ambiguous') {
+      return { status: 'ambiguous' };
+    }
+    if (outcome.status !== 'resolved') {
+      continue;
+    }
+    if (mode === 'team' && normalizedTask && !normalizedCommand) {
+      teamLineageAnchorHint ??= outcome.hint;
+    }
+    if (isApprovedExecutionLaunchHintReady(outcome.hint)) {
+      return outcome;
+    }
+    newestNonreadyHint ??= outcome.hint;
+  }
+
+  return newestNonreadyHint
+    ? { status: 'resolved', hint: newestNonreadyHint }
+    : { status: 'absent' };
 }
 
 export function readApprovedExecutionLaunchHint(
@@ -479,7 +803,7 @@ export function readApprovedExecutionLaunchHint(
   options: ApprovedExecutionLaunchHintReadOptions = {},
 ): ApprovedExecutionLaunchHint | null {
   const outcome = readApprovedExecutionLaunchHintOutcome(cwd, mode, options);
-  if (outcome.status !== 'resolved' || outcome.hint.contextPackStatus === 'missing-baseline') {
+  if (outcome.status !== 'resolved' || !isApprovedExecutionLaunchHintReady(outcome.hint)) {
     return null;
   }
   return outcome.hint;

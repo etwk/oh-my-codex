@@ -9,11 +9,11 @@
 [![npm version](https://img.shields.io/npm/v/oh-my-codex)](https://www.npmjs.com/package/oh-my-codex)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
-[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/PUwSMR9XNk)
+[![Discord](https://img.shields.io/discord/1452487457085063218?color=5865F2&logo=discord&logoColor=white&label=Discord)](https://discord.gg/sj4exxQ9v)
 
 **Вебсайт:** https://yeachan-heo.github.io/oh-my-codex-website/
 **Документація:** [Початок роботи](../getting-started.html) · [Агенти](../agents.html) · [Навички](../skills.html) · [Інтеграції](../integrations.html) · [Demo](../../DEMO.md) · [Посібник OpenClaw](../openclaw-integration.uk.md)
-**Спільнота:** [Discord](https://discord.gg/PUwSMR9XNk) — спільний сервер OMX/спільноти для oh-my-codex та суміжних інструментів.
+**Спільнота:** [Discord](https://discord.gg/sj4exxQ9v) — спільний сервер OMX/спільноти для oh-my-codex та суміжних інструментів.
 
 OMX — це шар робочих процесів для [OpenAI Codex CLI](https://github.com/openai/codex).
 
@@ -50,10 +50,21 @@ OMX — це шар робочих процесів для [OpenAI Codex CLI](ht
 
 Якщо ви хочете отримати стандартний досвід OMX, почніть тут:
 
+Оберіть один шлях інсталяції. Якщо Codex CLI вже встановлено (наприклад, через Homebrew):
+
 ```bash
-npm install -g @openai/codex oh-my-codex
+codex --version
+npm install -g oh-my-codex
 omx setup
 omx --madmax --high
+```
+
+Якщо Codex CLI ще не встановлено й ви хочете, щоб ним керував npm:
+
+```bash
+npm install -g @openai/codex
+npm install -g oh-my-codex
+omx setup
 ```
 
 Далі працюйте звично всередині Codex:
@@ -83,7 +94,7 @@ $team 3:executor "execute the approved plan in parallel"
 ### Вимоги
 
 - Node.js 20+
-- встановлений Codex CLI: `npm install -g @openai/codex`
+- встановлений Codex CLI, перевірений через `codex --version` (Homebrew або npm)
 - налаштована автентифікація Codex
 - `tmux` на macOS/Linux, якщо пізніше знадобиться стійкий командний рушій
 - `psmux` на нативному Windows, якщо пізніше знадобиться командний режим для Windows
@@ -182,7 +193,7 @@ omx sparkshell --tmux-pane %12 --tail-lines 400
 
 Для не-командних сесій OMX тепер працює переважно через нативні хуки:
 
-- `omx setup` має увімкнути нативні хуки Codex (`[features].codex_hooks = true`) у
+- `omx setup` має увімкнути нативні хуки Codex (`[features].hooks = true`) у
   підтримуваних областях.
 - локальні хуки Codex на рівні репозиторію є канонічною поверхнею автоматизації для не-командних сесій
 - `omx tmux-hook` зарезервовано для поведінки командного рушія та усунення проблем із застарілим tmux

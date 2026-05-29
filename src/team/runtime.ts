@@ -113,7 +113,7 @@ import { buildTeamWorkerGoalInstruction } from './goal-workflow.js';
 import { synthesizeDelegationPlan } from './delegation-policy.js';
 import { loadRolePrompt } from './role-router.js';
 import { composeRoleInstructionsForRole } from '../agents/native-config.js';
-import { codexPromptsDir, omxStateDir } from '../utils/paths.js';
+import { codexPromptsDir } from '../utils/paths.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   resolveTeamWorkerLaunchArgs,
@@ -133,10 +133,7 @@ import { buildRebalanceDecisions } from './rebalance-policy.js';
 import { getStatePath } from '../mcp/state-paths.js';
 import { readModeState, updateModeState } from '../modes/base.js';
 import {
-  isApprovedExecutionContextReadyStatus,
-  isApprovedExecutionFollowupReadyStatus,
-} from '../planning/artifacts.js';
-import {
+  buildApprovedTeamHandoffSection,
   buildApprovedTeamExecutionBinding,
   normalizeApprovedTeamExecutionBinding,
   readApprovedTeamExecutionHintOutcomeFromBinding,
@@ -144,6 +141,12 @@ import {
   writePersistedApprovedTeamExecutionBinding,
   type ApprovedTeamExecutionBinding,
 } from './approved-execution.js';
+import {
+  readPersistedTeamUltragoalContext,
+  renderLeaderOwnedUltragoalContextSection,
+  resolveLeaderOwnedUltragoalContext,
+  writePersistedTeamUltragoalContext,
+} from './ultragoal-context.js';
 import {
   appendTeamCommitHygieneEntries,
   buildTeamCommitHygieneContext,
@@ -168,6 +171,11 @@ import {
   findLaunchSafeCleanupCandidates,
   type CleanupResult,
 } from '../cli/cleanup.js';
+
+function joinContextSections(...sections: Array<string | undefined>): string | undefined {
+  const present = sections.filter((section): section is string => Boolean(section?.trim()));
+  return present.length > 0 ? present.join('\n\n') : undefined;
+}
 
 /** Snapshot of the team state at a point in time */
 export interface TeamSnapshot {
@@ -211,7 +219,11 @@ async function syncRootTeamModeStateOnTerminalPhase(
   if (phase !== 'complete' && phase !== 'failed' && phase !== 'cancelled') return;
 
   try {
-    const teamState = await readModeState('team', cwd);
+    const localStatePath = join(resolve(cwd), '.omx', 'state', 'team-state.json');
+    const localTeamState = existsSync(localStatePath)
+      ? JSON.parse(await readFile(localStatePath, 'utf-8')) as Record<string, unknown>
+      : null;
+    const teamState = localTeamState ?? await readModeState('team', cwd);
     if (!teamState) return;
 
     const stateTeamName = typeof teamState.team_name === 'string' ? teamState.team_name.trim() : '';
@@ -232,7 +244,11 @@ async function syncRootTeamModeStateOnTerminalPhase(
       updates.completed_at = new Date().toISOString();
     }
 
-    await updateModeState('team', updates, cwd);
+    if (localTeamState) {
+      await writeFile(localStatePath, JSON.stringify({ ...localTeamState, ...updates }, null, 2), 'utf-8');
+    } else {
+      await updateModeState('team', updates, cwd);
+    }
   } catch {
     // Best-effort compatibility sync only.
   }
@@ -1417,7 +1433,7 @@ export function teamRuntimeTeamRoot(teamName: string, cwd: string): string {
 }
 
 export function teamRuntimeSessionPath(cwd: string): string {
-  return join(omxStateDir(cwd), 'session.json');
+  return join(resolveCanonicalTeamStateRoot(cwd), 'session.json');
 }
 
 function createStartupTimingRecorder(teamName: string, cwd: string): StartupTimingRecorder {
@@ -1566,21 +1582,100 @@ async function assertNestedTeamAllowed(cwd: string): Promise<void> {
 
 type WorkerStartupEvidence = 'task_claim' | 'worker_progress' | 'leader_ack' | 'ready_prompt' | 'none';
 
+function resolveStartupEvidenceStateRoots(cwd: string): string[] {
+  return [...new Set([
+    resolve(cwd, '.omx', 'state'),
+    resolveCanonicalTeamStateRoot(cwd),
+  ])];
+}
+
+async function readStartupEvidenceWorkerStatus(
+  stateRoot: string,
+  teamName: string,
+  workerName: string,
+): Promise<Partial<WorkerStatus>> {
+  try {
+    const raw = await readFile(
+      join(stateRoot, 'team', teamName, 'workers', workerName, 'status.json'),
+      'utf-8',
+    );
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return {};
+    return parsed as Partial<WorkerStatus>;
+  } catch {
+    return {};
+  }
+}
+
+async function readStartupEvidenceTeamCreatedAt(
+  stateRoot: string,
+  teamName: string,
+): Promise<number | null> {
+  try {
+    const raw = await readFile(join(stateRoot, 'team', teamName, 'config.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as unknown;
+    const createdAt = parsed && typeof parsed === 'object'
+      ? (parsed as { created_at?: unknown }).created_at
+      : null;
+    if (typeof createdAt !== 'string') return null;
+    const timestamp = Date.parse(createdAt);
+    return Number.isFinite(timestamp) ? timestamp : null;
+  } catch {
+    return null;
+  }
+}
+
+async function hasStartupEvidenceLeaderAck(
+  stateRoot: string,
+  teamName: string,
+  workerName: string,
+): Promise<boolean> {
+  try {
+    const raw = await readFile(
+      join(stateRoot, 'team', teamName, 'mailbox', 'leader-fixed.json'),
+      'utf-8',
+    );
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return false;
+    const messages = (parsed as { messages?: unknown }).messages;
+    if (!Array.isArray(messages)) return false;
+    const teamCreatedAt = await readStartupEvidenceTeamCreatedAt(stateRoot, teamName);
+    return messages.some((message) => {
+      if (!message || typeof message !== 'object') return false;
+      if ((message as { from_worker?: unknown }).from_worker !== workerName) return false;
+      if (teamCreatedAt === null) return true;
+      const createdAt = (message as { created_at?: unknown }).created_at;
+      return typeof createdAt === 'string'
+        && Number.isFinite(Date.parse(createdAt))
+        && Date.parse(createdAt) >= teamCreatedAt;
+    });
+  } catch {
+    return false;
+  }
+}
+
 async function readWorkerStartupEvidence(
   teamName: string,
   workerName: string,
   cwd: string,
 ): Promise<WorkerStartupEvidence> {
-  const status = await readWorkerStatus(teamName, workerName, cwd);
-  if (typeof status.current_task_id === 'string' && status.current_task_id.trim() !== '') {
-    return 'task_claim';
+  const stateRoots = resolveStartupEvidenceStateRoots(cwd);
+  for (const stateRoot of stateRoots) {
+    const status = await readStartupEvidenceWorkerStatus(stateRoot, teamName, workerName);
+    if (typeof status.current_task_id === 'string' && status.current_task_id.trim() !== '') {
+      return 'task_claim';
+    }
   }
-  if (status.state === 'working' || status.state === 'blocked' || status.state === 'done' || status.state === 'failed') {
-    return 'worker_progress';
+  for (const stateRoot of stateRoots) {
+    const status = await readStartupEvidenceWorkerStatus(stateRoot, teamName, workerName);
+    if (status.state === 'working' || status.state === 'blocked' || status.state === 'done' || status.state === 'failed') {
+      return 'worker_progress';
+    }
   }
-  const leaderMailbox = await listMailboxMessages(teamName, 'leader-fixed', cwd).catch(() => []);
-  if (leaderMailbox.some((message) => message?.from_worker === workerName)) {
-    return 'leader_ack';
+  for (const stateRoot of stateRoots) {
+    if (await hasStartupEvidenceLeaderAck(stateRoot, teamName, workerName)) {
+      return 'leader_ack';
+    }
   }
   return 'none';
 }
@@ -1628,11 +1723,11 @@ function shouldSkipWorkerReadyWait(env: NodeJS.ProcessEnv): boolean {
   return env.OMX_TEAM_SKIP_READY_WAIT === '1';
 }
 
-function isRecoverableInteractiveStartupReason(reason: string): boolean {
+function isStartupEvidenceMissingReason(reason: string): boolean {
   const normalized = reason.trim().toLowerCase();
-  return normalized.includes('startup_no_evidence')
-    || normalized.includes('fallback_attempted_but_unconfirmed')
-    || normalized.includes('ready_prompt_timeout');
+  return normalized.includes('ready_prompt_timeout')
+    || normalized.includes('no_evidence')
+    || normalized.includes('fallback_attempted_but_unconfirmed');
 }
 
 async function recordRecoverableStartupIssue(params: {
@@ -1644,12 +1739,13 @@ async function recordRecoverableStartupIssue(params: {
 }): Promise<void> {
   const { teamName, workerName, taskIds, reason, cwd } = params;
   const updatedAt = new Date().toISOString();
+  const currentTaskId = isStartupEvidenceMissingReason(reason) ? undefined : taskIds[0];
   await writeWorkerStatus(
     teamName,
     workerName,
     {
       state: 'unknown',
-      current_task_id: taskIds[0],
+      current_task_id: currentTaskId,
       reason,
       updated_at: updatedAt,
     },
@@ -2230,7 +2326,7 @@ export async function startTeam(
   const workerLaunchMode = resolveTeamWorkerLaunchMode(launchEnv);
   const displayMode = workerLaunchMode === 'interactive' ? 'split_pane' : 'auto';
   const rawIdentityScope = resolveTeamIdentityScope(launchEnv);
-  const resolvedLeaderSessionId = await resolveLeaderSessionId(leaderCwd);
+  const resolvedLeaderSessionId = await resolveLeaderSessionId(leaderCwd, launchEnv);
   const identityScope = rawIdentityScope.source === 'run-id'
     ? (resolvedLeaderSessionId
       ? { ...rawIdentityScope, sessionId: resolvedLeaderSessionId, runId: '' }
@@ -2272,24 +2368,19 @@ export async function startTeam(
   const selectedApprovedExecutionHint = requestedApprovedExecutionOutcome?.status === 'resolved'
     ? requestedApprovedExecutionOutcome.approvedHint
     : null;
-  if (
-    requestedApprovedExecution
-    && selectedApprovedExecutionHint
-    && !isApprovedExecutionFollowupReadyStatus(selectedApprovedExecutionHint.contextPackStatus)
-  ) {
-    throw new Error(
-      `approved_execution_binding_nonready:${selectedApprovedExecutionHint.contextPackStatus}:${requestedApprovedExecution.prd_path}:${requestedApprovedExecution.task}`,
-    );
-  }
   if (requestedApprovedExecution && !selectedApprovedExecutionHint) {
     throw new Error(
       `approved_execution_binding_stale:${requestedApprovedExecution.prd_path}:${requestedApprovedExecution.task}`,
     );
   }
   const approvedExecution = selectedApprovedExecutionHint
-    && isApprovedExecutionContextReadyStatus(selectedApprovedExecutionHint.contextPackStatus)
     ? buildApprovedTeamExecutionBinding(selectedApprovedExecutionHint)
     : null;
+  const ultragoalContext = await resolveLeaderOwnedUltragoalContext(leaderCwd);
+  const approvedContextSection = joinContextSections(
+    buildApprovedTeamHandoffSection(selectedApprovedExecutionHint),
+    renderLeaderOwnedUltragoalContextSection(ultragoalContext),
+  );
   const activeWorktreeMode: 'detached' | 'named' | null =
     effectiveWorktreeMode.enabled
       ? (effectiveWorktreeMode.detached ? 'detached' : 'named')
@@ -2401,6 +2492,12 @@ export async function startTeam(
       sanitized,
       leaderCwd,
       approvedExecution,
+      teamStateRoot,
+    );
+    await writePersistedTeamUltragoalContext(
+      sanitized,
+      leaderCwd,
+      ultragoalContext,
       teamStateRoot,
     );
 
@@ -2527,7 +2624,10 @@ export async function startTeam(
         rolePromptContent: rawRolePromptContent ?? undefined,
         worktreeRootAgentsCanonical: Boolean(workerWorkspace.worktreePath),
         taskHints: effectiveDecompositionMetadata?.task_hints,
-        approvedContextSummary: effectiveDecompositionMetadata?.approved_context_summary,
+        approvedContextSection,
+        approvedContextSummary: approvedContextSection
+          ? undefined
+          : effectiveDecompositionMetadata?.approved_context_summary,
         workerGoalInstruction: buildTeamWorkerGoalInstruction(sanitized, workerName, workerTasks, { teamStateRoot }),
       });
       const triggerDirective = buildTriggerDirective(
@@ -2741,6 +2841,7 @@ export async function startTeam(
         })
         : null;
 
+      let startupReadyPromptObserved = false;
       if (workerLaunchMode === 'interactive' && !skipWorkerReadyWait && !initialPrompt && !startupDirectOutcome?.ok) {
         startupTiming.mark('ready_wait_start', { worker: workerName, pane_id: paneId });
         const ready = await waitForWorkerReadyAsync(sessionName, workerIndex, workerReadyTimeoutMs, paneId);
@@ -2755,19 +2856,18 @@ export async function startTeam(
               reason: 'ready_prompt_timeout',
               cwd: leaderCwd,
             });
-            return { ok: true, workerIndex, workerName };
+          } else {
+            return {
+              ok: false,
+              workerIndex,
+              workerName,
+              error: new Error(`Worker ${workerName} did not become ready in tmux session ${sessionName}`),
+            };
           }
-          return {
-            ok: false,
-            workerIndex,
-            workerName,
-            error: new Error(`Worker ${workerName} did not become ready in tmux session ${sessionName}`),
-          };
+        } else {
+          startupReadyPromptObserved = true;
         }
       }
-
-      const startupReadyPromptObserved =
-        workerLaunchMode === 'interactive' && !skipWorkerReadyWait && !initialPrompt;
 
       let dispatchOutcome: DispatchOutcome = initialPrompt
         ? { ok: true, transport: 'none', reason: 'startup_prompt_delivered_at_launch' }
@@ -2822,20 +2922,6 @@ export async function startTeam(
         const workerAlive = workerLaunchMode === 'prompt'
           ? isPromptWorkerAlive(config!, config!.workers[workerIndex - 1]!)
           : isWorkerPaneOpen(sessionName, workerIndex, paneId);
-        if (
-          workerLaunchMode === 'interactive'
-          && workerAlive
-          && isRecoverableInteractiveStartupReason(dispatchOutcome.reason)
-        ) {
-          await recordRecoverableStartupIssue({
-            teamName: sanitized,
-            workerName,
-            taskIds: workerTasks.map((task) => task.id),
-            reason: dispatchOutcome.reason,
-            cwd: leaderCwd,
-          });
-          return { ok: true, workerIndex, workerName };
-        }
         if (workerLaunchMode === 'prompt' && !workerAlive) {
           await recordPromptStartupWorkerStopped({
             teamName: sanitized,
@@ -3297,10 +3383,26 @@ export async function assignTask(
 
   try {
     // Retry dispatch up to 2 times to handle trust prompts during assignment (fixes #393).
+    const approvedExecutionState = await resolvePersistedApprovedTeamExecutionContinuityState(
+      sanitized,
+      config.leader_cwd ?? cwd,
+      config.team_state_root ?? resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
+    );
+    const persistedUltragoalContext = await readPersistedTeamUltragoalContext(
+      sanitized,
+      config.leader_cwd ?? cwd,
+      config.team_state_root ?? resolveCanonicalTeamStateRoot(config.leader_cwd ?? cwd),
+    );
+    const approvedContextSection = joinContextSections(
+      approvedExecutionState.status === 'valid'
+        ? buildApprovedTeamHandoffSection(approvedExecutionState.approvedHint)
+        : undefined,
+      renderLeaderOwnedUltragoalContextSection(persistedUltragoalContext),
+    );
     const taskForInbox = task.delegation
       ? task
       : (await updateTask(sanitized, taskId, { delegation: synthesizeDelegationPlan(task) }, cwd)) ?? task;
-    const inbox = generateTaskAssignmentInbox(workerName, sanitized, taskForInbox);
+    const inbox = generateTaskAssignmentInbox(workerName, sanitized, taskForInbox, { approvedContextSection });
     const maxAssignRetries = 2;
     const assignRetryDelayS = 2;
     let outcome: DispatchOutcome = { ok: false, transport: 'none', reason: 'not_attempted' };
@@ -3787,15 +3889,6 @@ export async function resumeTeam(teamName: string, cwd: string): Promise<TeamRun
       `approved_execution_binding_stale:${approvedExecutionState.binding.prd_path}:${approvedExecutionState.binding.task}`,
     );
   }
-  if (
-    approvedExecutionState.status === 'valid'
-    && !isApprovedExecutionFollowupReadyStatus(approvedExecutionState.approvedHint.contextPackStatus)
-  ) {
-    throw new Error(
-      `approved_execution_binding_nonready:${approvedExecutionState.approvedHint.contextPackStatus}:${approvedExecutionState.binding.prd_path}:${approvedExecutionState.binding.task}`,
-    );
-  }
-
   if (config.worker_launch_mode === 'prompt') {
     const handleTeamConfig = { ...config, name: sanitized };
     const hasLivePromptWorker = config.workers.some((worker) => isPromptWorkerAlive(handleTeamConfig, worker));
@@ -3924,8 +4017,8 @@ async function detectAndCleanStaleTeam(
   await cleanupTeamState(teamName, leaderCwd);
 }
 
-async function resolveLeaderSessionId(cwd: string): Promise<string> {
-  const fromEnv = process.env.OMX_SESSION_ID || process.env.CODEX_SESSION_ID || process.env.SESSION_ID;
+async function resolveLeaderSessionId(cwd: string, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+  const fromEnv = env.OMX_SESSION_ID || env.CODEX_SESSION_ID || env.SESSION_ID;
   if (fromEnv && fromEnv.trim() !== '') return fromEnv.trim();
 
   const p = teamRuntimeSessionPath(cwd);
@@ -4223,6 +4316,11 @@ async function attemptStartupDirectTrigger(params: {
       reason,
       cwd,
     });
+    return {
+      ...queued,
+      ok: false,
+      reason,
+    };
   }
 
   return {

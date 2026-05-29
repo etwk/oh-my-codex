@@ -42,10 +42,20 @@ function resolveCompatTarget(): { command: string; argsPrefix: string[] } {
 
 function runCompatTarget(cwd: string, argv: string[], envOverrides: Record<string, string> = {}): CompatRunResult {
   const target = resolveCompatTarget();
+  const env = { ...process.env };
+  for (const key of [
+    'USE_OMX_EXPLORE_CMD',
+    'OMX_ROOT',
+    'OMX_STATE_ROOT',
+    'OMXBOX_ACTIVE',
+    'OMX_SESSION_ID',
+  ]) {
+    delete env[key];
+  }
   const result = spawnSync(target.command, [...target.argsPrefix, ...argv], {
     cwd,
     encoding: 'utf-8',
-    env: { ...process.env, ...envOverrides },
+    env: { ...env, ...envOverrides },
   });
   return { status: result.status, stdout: result.stdout || '', stderr: result.stderr || '', error: result.error?.message };
 }
@@ -72,6 +82,9 @@ function normalizeInstallDoctorOutput(text: string, home: string, cwd: string): 
         return 'Results: <RESULTS>';
       }
       if (line.startsWith('Run "omx setup')) {
+        return 'Run <SETUP_FOLLOWUP>';
+      }
+      if (line.startsWith('Review warnings above. Use "omx setup')) {
         return 'Run <SETUP_FOLLOWUP>';
       }
       return line;

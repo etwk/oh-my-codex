@@ -6,6 +6,7 @@ import { withModeRuntimeContext } from './mode-state-context.js';
 import {
   getAllScopedStatePaths,
   getAuthoritativeActiveStateDirs,
+  getBaseStateDir,
   getReadScopedStateDirs,
   getReadScopedStatePaths,
   getStateDir,
@@ -15,6 +16,7 @@ import {
   validateSessionId,
   validateStateModeSegment,
 } from '../mcp/state-paths.js';
+import { evaluateRalphCompletionAuditEvidence } from '../ralph/completion-audit.js';
 import { ensureCanonicalRalphArtifacts } from '../ralph/persistence.js';
 import { RALPH_PHASES, validateAndNormalizeRalphState } from '../ralph/contract.js';
 import { applyRunOutcomeContract } from '../runtime/run-outcome.js';
@@ -22,7 +24,7 @@ import {
   SKILL_ACTIVE_STATE_MODE,
   readSkillActiveState,
   syncCanonicalSkillStateForMode,
-  writeSkillActiveStateCopies,
+  writeSkillActiveStateCopiesForStateDir,
 } from './skill-active.js';
 import { isTrackedWorkflowMode } from './workflow-transition.js';
 import { reconcileWorkflowTransition } from './workflow-transition-reconcile.js';
@@ -225,6 +227,7 @@ export async function executeStateOperation(
         await initializeStateEnvironment(cwd, effectiveSessionId);
 
         const mode = validateStateModeSegment(rawArgs.mode);
+        const baseStateDir = getBaseStateDir(cwd);
         const path = getStatePath(mode, cwd, effectiveSessionId);
         const {
           mode: _mode,
@@ -285,6 +288,16 @@ export async function executeStateOperation(
               validation.state.ralph_phase_normalized_from = originalPhase;
             }
             Object.assign(mergedRaw, validation.state);
+            if (mergedRaw.current_phase === 'complete') {
+              const completionAudit = evaluateRalphCompletionAuditEvidence(mergedRaw, cwd);
+              if (!completionAudit.complete) {
+                validationError = `ralph complete state requires passing completion_audit or repo-relative completion_audit_path (${completionAudit.reason})`;
+                return;
+              }
+              delete mergedRaw.completion_audit_gate;
+              delete mergedRaw.completion_audit_missing_reason;
+              delete mergedRaw.completion_audit_blocked_at;
+            }
             ensureRalphArtifacts = true;
           }
 
@@ -303,6 +316,7 @@ export async function executeStateOperation(
                 action: 'write',
                 sessionId: effectiveSessionId,
                 source: 'state-operations',
+                baseStateDir,
               });
               transitionMessage ??= transition.transitionMessage;
             } catch (error) {
@@ -325,7 +339,7 @@ export async function executeStateOperation(
         if (mode === SKILL_ACTIVE_STATE_MODE) {
           const state = await readSkillActiveState(path);
           if (state) {
-            await writeSkillActiveStateCopies(cwd, state, effectiveSessionId);
+            await writeSkillActiveStateCopiesForStateDir(baseStateDir, state, effectiveSessionId);
           }
         } else {
           if (mode === 'ralph' && ensureRalphArtifacts) {
@@ -334,6 +348,7 @@ export async function executeStateOperation(
           const data = JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>;
           await syncCanonicalSkillStateForMode({
             cwd,
+            baseStateDir,
             mode,
             active: data.active === true,
             currentPhase: typeof data.current_phase === 'string' ? data.current_phase : undefined,
@@ -358,6 +373,7 @@ export async function executeStateOperation(
         await initializeStateEnvironment(cwd, effectiveSessionId);
 
         const mode = validateStateModeSegment(rawArgs.mode);
+        const baseStateDir = getBaseStateDir(cwd);
         const allSessions = rawArgs.all_sessions === true;
 
         if (!allSessions) {
@@ -374,6 +390,7 @@ export async function executeStateOperation(
           if (mode !== SKILL_ACTIVE_STATE_MODE) {
             await syncCanonicalSkillStateForMode({
               cwd,
+              baseStateDir,
               mode,
               active: false,
               sessionId: effectiveSessionId,
@@ -393,6 +410,7 @@ export async function executeStateOperation(
         if (mode !== SKILL_ACTIVE_STATE_MODE) {
           await syncCanonicalSkillStateForMode({
             cwd,
+            baseStateDir,
             mode,
             active: false,
             source: 'state-operations',

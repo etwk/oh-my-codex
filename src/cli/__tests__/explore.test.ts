@@ -12,6 +12,7 @@ import {
   buildExploreHarnessArgs,
   buildExplorePromptWithWikiContext,
   exploreCommand,
+  EXPLORE_DEPRECATION_NOTICE,
   EXPLORE_USAGE,
   loadExplorePrompt,
   packagedExploreHarnessBinaryName,
@@ -296,6 +297,17 @@ describe('parseExploreArgs', () => {
     assert.throws(() => parseExploreArgs(['--bogus']), /Unknown argument/);
   });
 
+  it('rejects positional prompt text with a corrective --prompt hint', () => {
+    assert.throws(
+      () => parseExploreArgs(['find package.json']),
+      /Positional prompt text is not supported\. Use: omx explore --prompt "find package\.json"/,
+    );
+    assert.throws(
+      () => parseExploreArgs(['find', 'package.json']),
+      /Positional prompt text is not supported\. Use: omx explore --prompt "find package\.json"/,
+    );
+  });
+
   it('rejects duplicate prompt sources', () => {
     assert.throws(() => parseExploreArgs(['--prompt', 'find auth', '--prompt-file', 'prompt.md']), /Choose exactly one/);
   });
@@ -306,6 +318,23 @@ describe('parseExploreArgs', () => {
 
   it('rejects missing prompt value', () => {
     assert.throws(() => parseExploreArgs(['--prompt']), /Missing text after --prompt/);
+  });
+});
+
+describe('exploreCommand help', () => {
+  it('prints explore-specific usage for --help', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-help-'));
+    try {
+      const result = await runExploreCommandForTest(wd, ['--help']);
+      assert.equal(result.exitCode, 0);
+      assert.match(result.stdout, /Usage: omx explore --prompt "<prompt>"/);
+      assert.match(result.stdout, /omx explore --prompt-file <file>/);
+      assert.match(result.stdout, /Never use positional prompt text/i);
+      assert.match(result.stdout, /DEPRECATED: `omx explore` is deprecated/i);
+      assert.equal(result.stderr, '');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -797,7 +826,7 @@ describe('exploreCommand', () => {
       assert.equal(result.exitCode, 0);
       assert.match(result.stdout, /local fast-path used \(text lookup\)/);
       assert.match(result.stdout, /src\/auth\.ts:1/);
-      assert.equal(result.stderr, '');
+      assert.equal(result.stderr, `${EXPLORE_DEPRECATION_NOTICE}\n`);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -821,7 +850,7 @@ describe('exploreCommand', () => {
       assert.match(result.stdout, /# Demo README/);
       assert.match(result.stdout, /This content must be visible\./);
       assert.doesNotMatch(result.stdout.trim(), /^.*README\.md \(\d+ bytes\)$/);
-      assert.equal(result.stderr, '');
+      assert.equal(result.stderr, `${EXPLORE_DEPRECATION_NOTICE}\n`);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -842,7 +871,7 @@ describe('exploreCommand', () => {
       assert.equal(result.exitCode, 0);
       assert.match(result.stdout, /# Demo README/);
       assert.match(result.stdout, /\[truncated: file exceeds local fast-path limit/);
-      assert.equal(result.stderr, '');
+      assert.equal(result.stderr, `${EXPLORE_DEPRECATION_NOTICE}\n`);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -887,7 +916,7 @@ describe('exploreCommand', () => {
       assert.equal(result.exitCode, 0);
       assert.match(result.stdout, /harness-fallback/);
       assert.doesNotMatch(result.stdout, /local fast-path used \(text lookup\)/);
-      assert.equal(result.stderr, '');
+      assert.equal(result.stderr, `${EXPLORE_DEPRECATION_NOTICE}\n`);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
@@ -915,6 +944,30 @@ describe('exploreCommand', () => {
     }
   });
 
+  it('emits verbose telemetry when explore uses the sparkshell backend', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-explore-sparkshell-telemetry-'));
+    try {
+      const sparkshellStub = join(wd, 'sparkshell-stub.sh');
+      const harnessStub = join(wd, 'explore-stub.sh');
+      await writeFile(sparkshellStub, `#!/bin/sh\nprintf '# Answer\\n- telemetry route\\n'\n`);
+      await writeFile(harnessStub, '#!/bin/sh\nprintf harness-should-not-run\n');
+      await chmod(sparkshellStub, 0o755);
+      await chmod(harnessStub, 0o755);
+
+      const result = runOmx(wd, ['explore', '--verbose', '--prompt', 'git log --oneline'], {
+        OMX_SPARKSHELL_BIN: sparkshellStub,
+        OMX_EXPLORE_BIN: harnessStub,
+      });
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(result.stderr, /backend=sparkshell reason=long-output/);
+      assert.match(result.stdout, /telemetry route/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('routes qualifying read-only shell commands through sparkshell instead of the direct harness', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-explore-sparkshell-route-'));
     try {
@@ -937,7 +990,7 @@ describe('exploreCommand', () => {
 
       assert.equal(result.status, 0, result.stderr || result.stdout);
       assert.equal(result.stdout, '# Answer\n- routed via sparkshell\n');
-      assert.equal(result.stderr, '');
+      assert.equal(result.stderr, `${EXPLORE_DEPRECATION_NOTICE}\n`);
       const captured = (await readFile(capturePath, 'utf-8')).trim().split('\n');
       assert.deepEqual(captured, ['git', 'log', '--oneline']);
     } finally {
@@ -1040,7 +1093,7 @@ describe('exploreCommand', () => {
         process.stderr.write = originalStderr;
       }
 
-      assert.equal(stderrChunks.join(''), '');
+      assert.equal(stderrChunks.join(''), `${EXPLORE_DEPRECATION_NOTICE}\n`);
       assert.equal(stdoutChunks.join(''), '# Files\n- demo\n');
       const captured = (await readFile(capturePath, 'utf-8')).trim().split('\n');
       assert.ok(captured.includes('--prompt'));
@@ -1147,7 +1200,7 @@ describe('exploreCommand', () => {
         assert.equal(result.status, 0, result.stderr || result.stdout);
         assert.equal(result.stdout, '# Answer\nHarness completed\n');
         const captured = await readFile(capturePath, 'utf-8');
-        assert.match(captured, /ARGV0=.*\/node$/m);
+        assert.match(captured, /ARGV0=.*\/node(?:-\d+(?:\.\d+)*)?$/m);
         assert.match(captured, /ARGV1=.*node_modules\/@openai\/codex\/bin\/codex\.js$/m);
         assert.match(captured, /PATH=.*omx-explore-allowlist-/);
         assert.doesNotMatch(captured, /PATH=.*node_modules\/\.bin/);

@@ -1,4 +1,4 @@
-import { describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 import { once } from 'node:events';
 import assert from 'node:assert/strict';
 import { appendFile, chmod, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
@@ -11,6 +11,30 @@ import { buildTmuxSessionName, buildWindowsMsysBackgroundHelperBootstrapScript }
 import { writeSessionStart } from '../session.js';
 
 const DEFAULT_AUTO_NUDGE_RESPONSE = 'continue with the current task only if it is already authorized';
+const INHERITED_OMX_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_SESSION_ID',
+  'OMX_SOURCE_CWD',
+  'OMX_STARTUP_CWD',
+  'OMX_ENTRY_PATH',
+] as const;
+const inheritedOmxEnv = new Map<string, string | undefined>();
+
+before(() => {
+  for (const key of INHERITED_OMX_ENV_KEYS) {
+    inheritedOmxEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
+
+after(() => {
+  for (const key of INHERITED_OMX_ENV_KEYS) {
+    const value = inheritedOmxEnv.get(key);
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
+});
 
 async function appendLine(path: string, line: object): Promise<void> {
   const prev = await readFile(path, 'utf-8');
@@ -385,6 +409,10 @@ function buildCleanNotifyEnv(
     OMX_TEAM_STATE_ROOT: '',
     OMX_TEAM_LEADER_CWD: '',
     OMX_MODEL_INSTRUCTIONS_FILE: '',
+    OMX_ROOT: '',
+    OMX_STATE_ROOT: '',
+    OMX_SOURCE_CWD: '',
+    OMX_STARTUP_CWD: '',
     TMUX: '',
     TMUX_PANE: '',
     ...overrides,
@@ -421,8 +449,36 @@ describe('notify-fallback watcher', () => {
       const staleIso = new Date(Date.now() - 60_000).toISOString();
       const freshIso = new Date(Date.now() + 2_000).toISOString();
       const threadId = `thread-${sid}`;
+      const leaderThreadId = `leader-${sid}`;
       const staleTurn = `turn-stale-${sid}`;
       const freshTurn = `turn-fresh-${sid}`;
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: sid }));
+      await writeFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), JSON.stringify({
+        schemaVersion: 1,
+        sessions: {
+          [sid]: {
+            session_id: sid,
+            leader_thread_id: leaderThreadId,
+            updated_at: staleIso,
+            threads: {
+              [leaderThreadId]: {
+                thread_id: leaderThreadId,
+                kind: 'leader',
+                first_seen_at: staleIso,
+                last_seen_at: staleIso,
+                turn_count: 1,
+              },
+              [threadId]: {
+                thread_id: threadId,
+                kind: 'subagent',
+                first_seen_at: staleIso,
+                last_seen_at: staleIso,
+                turn_count: 1,
+              },
+            },
+          },
+        },
+      }));
 
       const lines = [
         {
@@ -469,6 +525,12 @@ describe('notify-fallback watcher', () => {
       const fallbackLog = join(wd, '.omx', 'logs', `notify-fallback-${new Date().toISOString().split('T')[0]}.jsonl`);
       const fallbackEntries = await readJsonLines(fallbackLog);
       assert.deepEqual(fallbackEntries.map((entry) => entry.type), ['fallback_notify']);
+
+      const tracking = JSON.parse(await readFile(join(wd, '.omx', 'state', 'subagent-tracking.json'), 'utf-8'));
+      const completedThread = tracking.sessions?.[sid]?.threads?.[threadId];
+      assert.equal(completedThread?.completed_at ? true : false, true);
+      assert.equal(completedThread?.last_completed_turn_id, freshTurn);
+      assert.equal(completedThread?.completion_source, 'notify-fallback-watcher');
     } finally {
       await rm(wd, { recursive: true, force: true });
       await rm(tempHome, { recursive: true, force: true });

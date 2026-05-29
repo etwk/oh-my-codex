@@ -2,9 +2,11 @@
  * omx doctor - Validate oh-my-codex installation
  */
 
-import { existsSync } from "fs";
-import { readdir, readFile } from "fs/promises";
-import { join } from "path";
+import { existsSync, readFileSync } from "fs";
+import { mkdtemp, readdir, readFile, rm } from "fs/promises";
+import { spawnSync } from "child_process";
+import { basename, join } from "path";
+import { tmpdir } from "os";
 import {
 	codexHome,
 	codexConfigPath,
@@ -13,6 +15,7 @@ import {
 	projectSkillsDir,
 	omxStateDir,
 	detectLegacySkillRootOverlap,
+	codexAgentsDir,
 } from "../utils/paths.js";
 import {
 	classifySpawnError,
@@ -30,7 +33,13 @@ import {
 	hasLegacyOmxTeamRunTable,
 	getModelContextRecommendation,
 } from "../config/generator.js";
-import { getMissingManagedCodexHookEvents } from "../config/codex-hooks.js";
+import {
+	MANAGED_HOOK_EVENTS,
+	buildManagedCodexNativeHookCommand,
+	discoverCodexHookConfigPaths,
+	getManagedCodexHookCommandsForEvent,
+	getMissingManagedCodexHookEvents,
+} from "../config/codex-hooks.js";
 import { OMX_FIRST_PARTY_MCP_SERVER_NAMES } from "../config/omx-first-party-mcp.js";
 import { getDefaultBridge, isBridgeEnabled } from "../runtime/bridge.js";
 import {
@@ -47,11 +56,18 @@ import { readTriageConfig } from "../hooks/triage-config.js";
 import {
 	readPersistedSetupPreferences,
 	type SetupInstallMode,
+	type SetupMcpMode,
 } from "./setup-preferences.js";
 import {
 	OMX_LOCAL_MARKETPLACE_NAME,
+	OMX_LOCAL_PLUGIN_CONFIG_KEY,
+	discoverOmxPluginCacheDirs,
+	expectedPackagedOmxSkillNames,
+	packagedOmxPluginVersion,
+	readOmxPluginCacheState,
 	resolvePackagedOmxMarketplace,
 } from "./plugin-marketplace.js";
+import { hasOmxAgentsContract } from "../utils/agents-md.js";
 
 interface DoctorOptions {
 	verbose?: boolean;
@@ -66,12 +82,19 @@ interface Check {
 	message: string;
 }
 
+interface NativeHookDistSmokeOptions {
+	packageRoot?: string;
+	nodePath?: string;
+	runner?: typeof spawnSync;
+}
+
 type DoctorSetupScope = "user" | "project";
 
 interface DoctorScopeResolution {
 	scope: DoctorSetupScope;
 	source: "persisted" | "default";
 	installMode?: SetupInstallMode;
+	mcpMode?: SetupMcpMode;
 }
 
 interface DoctorPaths {
@@ -80,6 +103,7 @@ interface DoctorPaths {
 	hooksPath: string;
 	promptsDir: string;
 	skillsDir: string;
+	agentsDir: string;
 	stateDir: string;
 }
 
@@ -90,6 +114,7 @@ async function resolveDoctorScope(cwd: string): Promise<DoctorScopeResolution> {
 			scope: persisted.scope,
 			source: "persisted",
 			installMode: persisted.installMode,
+			mcpMode: persisted.mcpMode ?? "none",
 		};
 	}
 
@@ -105,6 +130,7 @@ function resolveDoctorPaths(cwd: string, scope: DoctorSetupScope): DoctorPaths {
 			hooksPath: join(codexHomeDir, "hooks.json"),
 			promptsDir: join(codexHomeDir, "prompts"),
 			skillsDir: projectSkillsDir(cwd),
+			agentsDir: codexAgentsDir(codexHomeDir),
 			stateDir: omxStateDir(cwd),
 		};
 	}
@@ -115,6 +141,7 @@ function resolveDoctorPaths(cwd: string, scope: DoctorSetupScope): DoctorPaths {
 		hooksPath: join(codexHome(), "hooks.json"),
 		promptsDir: codexPromptsDir(),
 		skillsDir: userSkillsDir(),
+		agentsDir: codexAgentsDir(),
 		stateDir: omxStateDir(cwd),
 	};
 }
@@ -143,6 +170,11 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 			`Resolved setup install mode: ${scopeResolution.installMode}${scopeSourceMessage}`,
 		);
 	}
+	if (scopeResolution.mcpMode) {
+		console.log(
+			`Resolved setup MCP mode: ${scopeResolution.mcpMode}${scopeSourceMessage}`,
+		);
+	}
 	console.log();
 
 	const checks: Check[] = [];
@@ -169,7 +201,23 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	if (contextRecommendationCheck) checks.push(contextRecommendationCheck);
 
 	// Check 4.25: Native hooks coverage
-	checks.push(await checkNativeHooks(paths.hooksPath, paths.configPath));
+	checks.push(
+		await checkNativeHooks(paths.hooksPath, paths.configPath, {
+			codexHomeDir: paths.codexHomeDir,
+			installMode: scopeResolution.installMode,
+		}),
+	);
+	checks.push(await checkNativeHookDistSmoke());
+	if (options.verbose) {
+		const postCompactRuntimeCheck = await checkNativePostCompactHookRuntime(
+			paths.hooksPath,
+			cwd,
+			paths.codexHomeDir,
+		);
+		if (postCompactRuntimeCheck) checks.push(postCompactRuntimeCheck);
+	}
+	const runtimeMirrorCheck = await checkNativeHookRuntimeMirrors(cwd, paths.hooksPath);
+	if (runtimeMirrorCheck) checks.push(runtimeMirrorCheck);
 
 	// Check 4.5: Explore routing default
 	checks.push(await checkExploreRouting(paths.configPath));
@@ -184,6 +232,13 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 6: Skills installed
 	checks.push(await checkSkills(paths, scopeResolution.installMode));
+
+	// Check 6.25: Native reviewer roles required by RALPLAN/Autopilot
+	const nativeReviewerRolesCheck = checkNativeReviewerRoles(
+		paths,
+		scopeResolution.installMode,
+	);
+	if (nativeReviewerRolesCheck) checks.push(nativeReviewerRolesCheck);
 
 	// Check 6.5: Legacy/current skill-root overlap
 	if (scopeResolution.scope === "user") {
@@ -204,7 +259,11 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 
 	// Check 9: MCP servers configured
 	checks.push(
-		await checkMcpServers(paths.configPath, scopeResolution.installMode),
+		await checkMcpServers(
+			paths.configPath,
+			scopeResolution.installMode,
+			scopeResolution.mcpMode,
+		),
 	);
 
 	// Check 10: Prompt triage
@@ -235,7 +294,9 @@ export async function doctor(options: DoctorOptions = {}): Promise<void> {
 	if (failCount > 0) {
 		console.log('\nRun "omx setup" to fix installation issues.');
 	} else if (warnCount > 0) {
-		console.log('\nRun "omx setup --force" to refresh all components.');
+		console.log(
+			'\nReview warnings above. Use "omx setup --force" only when a warning recommends full replacement; for AGENTS.md preservation prefer "omx setup --merge-agents".',
+		);
 	} else {
 		console.log("\nAll checks passed! oh-my-codex is ready.");
 	}
@@ -856,15 +917,20 @@ async function checkModelContextRecommendation(
 
 async function checkExploreRouting(configPath: string): Promise<Check> {
 	const envValue = process.env[OMX_EXPLORE_CMD_ENV];
-	if (
-		typeof envValue === "string" &&
-		!isExploreCommandRoutingEnabled(process.env)
-	) {
+	if (typeof envValue === "string") {
+		if (isExploreCommandRoutingEnabled(process.env)) {
+			return {
+				name: "Explore routing",
+				status: "warn",
+				message:
+					"deprecated compatibility routing enabled by environment override; remove USE_OMX_EXPLORE_CMD or set it to 0 and use normal Codex repo inspection or omx sparkshell instead",
+			};
+		}
 		return {
 			name: "Explore routing",
-			status: "warn",
+			status: "pass",
 			message:
-				"disabled by environment override; enable with USE_OMX_EXPLORE_CMD=1 (or remove the explicit opt-out)",
+				"deprecated compatibility routing disabled by environment override (recommended)",
 		};
 	}
 
@@ -872,7 +938,7 @@ async function checkExploreRouting(configPath: string): Promise<Check> {
 		return {
 			name: "Explore routing",
 			status: "pass",
-			message: "enabled by default (config.toml not found yet)",
+			message: "deprecated by default (config.toml not found yet)",
 		};
 	}
 
@@ -886,24 +952,28 @@ async function checkExploreRouting(configPath: string): Promise<Check> {
 			parsed?.shell_environment_policy?.set?.USE_OMX_EXPLORE_CMD ??
 			parsed?.env?.USE_OMX_EXPLORE_CMD;
 
-		if (
-			typeof configuredValue === "string" &&
-			!isExploreCommandRoutingEnabled({
+		if (typeof configuredValue === "string") {
+			if (isExploreCommandRoutingEnabled({
 				USE_OMX_EXPLORE_CMD: configuredValue,
-			})
-		) {
+			})) {
+				return {
+					name: "Explore routing",
+					status: "warn",
+					message:
+						'deprecated compatibility routing enabled in config.toml; set USE_OMX_EXPLORE_CMD = "0" under [shell_environment_policy.set] and use normal Codex repo inspection or omx sparkshell instead',
+				};
+			}
 			return {
 				name: "Explore routing",
-				status: "warn",
-				message:
-					'disabled in config.toml; set USE_OMX_EXPLORE_CMD = "1" under [shell_environment_policy.set] to restore default explore-first routing',
+				status: "pass",
+				message: "deprecated compatibility routing disabled in config.toml (recommended)",
 			};
 		}
 
 		return {
 			name: "Explore routing",
 			status: "pass",
-			message: "enabled by default",
+			message: "deprecated by default",
 		};
 	} catch {
 		return {
@@ -914,17 +984,35 @@ async function checkExploreRouting(configPath: string): Promise<Check> {
 	}
 }
 
+const LORE_COMMIT_GUARD_EXPLICIT_OPT_OUT_VALUES = new Set([
+	"0",
+	"false",
+	"no",
+	"off",
+]);
+
 async function checkLoreCommitGuard(configPath: string): Promise<Check> {
 	const envValue = process.env[OMX_LORE_COMMIT_GUARD_ENV];
-	if (
-		typeof envValue === "string" &&
-		!isLoreCommitGuardEnabled(process.env)
-	) {
+	if (typeof envValue === "string") {
+		if (isLoreCommitGuardEnabled(process.env)) {
+			return {
+				name: "Lore commit guard",
+				status: "pass",
+				message: "enabled by environment opt-in",
+			};
+		}
+		if (!isExplicitLoreCommitGuardOptOut(envValue)) {
+			return {
+				name: "Lore commit guard",
+				status: "warn",
+				message:
+					"invalid environment value; Lore commit enforcement is disabled until OMX_LORE_COMMIT_GUARD is set to 1, true, yes, or on",
+			};
+		}
 		return {
 			name: "Lore commit guard",
-			status: "warn",
-			message:
-				"disabled by environment override; enable with OMX_LORE_COMMIT_GUARD=1 (or remove the explicit opt-out)",
+			status: "pass",
+			message: "disabled by environment/default opt-out; enable with OMX_LORE_COMMIT_GUARD=1",
 		};
 	}
 
@@ -932,7 +1020,7 @@ async function checkLoreCommitGuard(configPath: string): Promise<Check> {
 		return {
 			name: "Lore commit guard",
 			status: "pass",
-			message: "enabled by default (config.toml not found yet)",
+			message: "disabled by default (config.toml not found yet)",
 		};
 	}
 
@@ -946,24 +1034,36 @@ async function checkLoreCommitGuard(configPath: string): Promise<Check> {
 			parsed?.shell_environment_policy?.set?.[OMX_LORE_COMMIT_GUARD_ENV] ??
 			parsed?.env?.[OMX_LORE_COMMIT_GUARD_ENV];
 
-		if (
-			typeof configuredValue === "string" &&
-			!isLoreCommitGuardEnabled({
+		if (typeof configuredValue === "string") {
+			if (isLoreCommitGuardEnabled({
 				[OMX_LORE_COMMIT_GUARD_ENV]: configuredValue,
-			})
-		) {
+			})) {
+				return {
+					name: "Lore commit guard",
+					status: "pass",
+					message: "enabled by config.toml opt-in",
+				};
+			}
+			if (!isExplicitLoreCommitGuardOptOut(configuredValue)) {
+				return {
+					name: "Lore commit guard",
+					status: "warn",
+					message:
+						'invalid config.toml value; Lore commit enforcement is disabled until OMX_LORE_COMMIT_GUARD = "1" (or true/yes/on) is set under [shell_environment_policy.set]',
+				};
+			}
 			return {
 				name: "Lore commit guard",
-				status: "warn",
+				status: "pass",
 				message:
-					'disabled in config.toml; set OMX_LORE_COMMIT_GUARD = "1" under [shell_environment_policy.set] to restore default Lore commit enforcement',
+					'disabled in config.toml/default opt-out; set OMX_LORE_COMMIT_GUARD = "1" under [shell_environment_policy.set] to enable Lore commit enforcement',
 			};
 		}
 
 		return {
 			name: "Lore commit guard",
 			status: "pass",
-			message: "enabled by default",
+			message: "disabled by default",
 		};
 	} catch {
 		return {
@@ -974,23 +1074,233 @@ async function checkLoreCommitGuard(configPath: string): Promise<Check> {
 	}
 }
 
+function isExplicitLoreCommitGuardOptOut(value: string): boolean {
+	return LORE_COMMIT_GUARD_EXPLICIT_OPT_OUT_VALUES.has(
+		value.trim().toLowerCase(),
+	);
+}
+
+interface NativeHookCheckContext {
+	codexHomeDir: string;
+	installMode?: SetupInstallMode;
+}
+
+function isEnabledTomlValue(value: unknown): boolean {
+	return value === true || (typeof value === "string" && ["1", "true", "yes", "on"].includes(value.trim().toLowerCase()));
+}
+
+function configHasOmxEntries(configContent: string): boolean {
+	return configContent.includes("omx_") || configContent.includes("oh-my-codex");
+}
+
+function configEnablesPluginScopedHooks(configContent: string): boolean {
+	try {
+		const parsed = parseToml(configContent) as {
+			plugin_hooks?: unknown;
+			features?: Record<string, unknown>;
+		};
+		return isEnabledTomlValue(parsed.plugin_hooks) || isEnabledTomlValue(parsed.features?.plugin_hooks);
+	} catch {
+		return /^\s*plugin_hooks\s*=\s*(?:true|1|"true"|"1"|"yes"|"on")\s*$/m.test(configContent);
+	}
+}
+
+function pluginHooksJsonHasNativeCoverage(content: string): boolean | null {
+	try {
+		const parsed = JSON.parse(content) as { hooks?: Record<string, unknown> };
+		if (!parsed || typeof parsed !== "object" || typeof parsed.hooks !== "object" || parsed.hooks === null) {
+			return false;
+		}
+		return MANAGED_HOOK_EVENTS.every((eventName) => {
+			const entries = parsed.hooks?.[eventName];
+			if (!Array.isArray(entries)) return false;
+			return entries.some((entry) => {
+				if (!entry || typeof entry !== "object") return false;
+				const hooks = (entry as { hooks?: unknown }).hooks;
+				if (!Array.isArray(hooks)) return false;
+				return hooks.some((hook) => {
+					if (!hook || typeof hook !== "object") return false;
+					const command = (hook as { command?: unknown }).command;
+					return typeof command === "string" && command.includes("codex-native-hook.mjs");
+				});
+			});
+		});
+	} catch {
+		return null;
+	}
+}
+
+async function checkPluginScopedNativeHooks(
+	codexHomeDir: string,
+	setupHooksPath: string,
+): Promise<Check> {
+	const setupHooksPathDescription = existsSync(setupHooksPath)
+		? `existing hooks.json at ${setupHooksPath} is treated as user-owned because plugin-scoped hooks are enabled`
+		: `setup-owned hooks.json is intentionally absent at ${setupHooksPath}`;
+	const packagedMarketplace = await resolvePackagedOmxMarketplace(getPackageRoot());
+	if (!packagedMarketplace) {
+		return {
+			name: "Native hooks",
+			status: "warn",
+			message:
+				`plugin-scoped hooks are enabled and ${setupHooksPathDescription}, but packaged ${OMX_LOCAL_MARKETPLACE_NAME} metadata was not found`,
+		};
+	}
+
+	const version = await packagedOmxPluginVersion(packagedMarketplace);
+	const expectedCacheDir = version
+		? join(codexHomeDir, "plugins", "cache", OMX_LOCAL_MARKETPLACE_NAME, "oh-my-codex", version)
+		: join(codexHomeDir, "plugins", "cache", OMX_LOCAL_MARKETPLACE_NAME, "oh-my-codex", "<version>");
+	const expectedHooksPath = join(expectedCacheDir, "hooks", "hooks.json");
+	const expectedHookLauncherPath = join(expectedCacheDir, "hooks", "codex-native-hook.mjs");
+	const expectedPinnedLauncherPath = join(expectedCacheDir, "hooks", "omx-command.json");
+	const state = await readOmxPluginCacheState(expectedCacheDir);
+
+	if (!state) {
+		return {
+			name: "Native hooks",
+			status: "warn",
+			message:
+				`plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing at ${join(expectedCacheDir, ".codex-plugin", "plugin.json")}; ${setupHooksPathDescription}; run "omx setup --plugin --force" to refresh the plugin cache`,
+		};
+	}
+
+	if (state.hooksPointer !== "./hooks/hooks.json") {
+		return {
+			name: "Native hooks",
+			status: "warn",
+			message:
+				`plugin-scoped hooks are enabled, but the Codex plugin cache manifest points hooks to ${String(state.hooksPointer)} instead of ./hooks/hooks.json at ${expectedHooksPath}; run "omx setup --plugin --force" to refresh the plugin cache`,
+		};
+	}
+
+	for (const expectedPath of [expectedHooksPath, expectedHookLauncherPath, expectedPinnedLauncherPath]) {
+		if (!existsSync(expectedPath)) {
+			return {
+				name: "Native hooks",
+				status: "warn",
+				message:
+					`plugin-scoped hooks are enabled, but expected plugin hook file is missing at ${expectedPath}; ${setupHooksPathDescription}; run "omx setup --plugin --force" to refresh the plugin cache`,
+			};
+		}
+	}
+
+	let hookContent: string;
+	try {
+		hookContent = await readFile(expectedHooksPath, "utf-8");
+	} catch {
+		return {
+			name: "Native hooks",
+			status: "fail",
+			message: `cannot read plugin-scoped hooks.json at ${expectedHooksPath}`,
+		};
+	}
+
+	const hasCoverage = pluginHooksJsonHasNativeCoverage(hookContent);
+	if (hasCoverage === null) {
+		return {
+			name: "Native hooks",
+			status: "fail",
+			message: `invalid plugin-scoped hooks.json at ${expectedHooksPath}`,
+		};
+	}
+	if (!hasCoverage) {
+		return {
+			name: "Native hooks",
+			status: "warn",
+			message:
+				`plugin-scoped hooks.json at ${expectedHooksPath} is missing OMX native coverage for one or more events; run "omx setup --plugin --force" to refresh the plugin cache`,
+		};
+	}
+
+	const smokeCwd = await mkdtemp(join(tmpdir(), "omx-doctor-plugin-hook-"));
+	try {
+		const payload = JSON.stringify({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "omx-doctor-plugin-hook-smoke",
+			transcript_path: join(smokeCwd, "nonexistent-transcript.jsonl"),
+			cwd: smokeCwd,
+			prompt: "doctor plugin hook smoke test",
+		});
+		const result = spawnSync(process.execPath, [expectedHookLauncherPath], {
+			cwd: smokeCwd,
+			encoding: "utf-8",
+			env: {
+				...process.env,
+				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
+				OMX_ROOT: join(smokeCwd, ".omx-doctor-root"),
+				OMX_SESSION_ID: "omx-doctor-plugin-hook-smoke",
+				OMX_SOURCE_CWD: smokeCwd,
+				OMX_STARTUP_CWD: smokeCwd,
+			},
+			input: payload,
+			timeout: 5_000,
+		});
+		if (result.error) {
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message: `plugin-scoped native hook smoke failed to run from ${expectedHookLauncherPath} (${result.error.message})`,
+			};
+		}
+		if (result.status !== 0) {
+			const detail = (result.stderr || result.stdout || `exit ${result.status}`).trim();
+			return {
+				name: "Native hooks",
+				status: "fail",
+				message: `plugin-scoped native hook smoke failed from ${expectedHookLauncherPath} (${detail})`,
+			};
+		}
+	} finally {
+		await rm(smokeCwd, { recursive: true, force: true });
+	}
+
+	return {
+		name: "Native hooks",
+		status: "pass",
+		message:
+			`plugin-scoped hooks are enabled; ${setupHooksPathDescription}, and plugin cache native hook coverage smoke passed via ${expectedHooksPath}`,
+	};
+}
+
 async function checkNativeHooks(
 	hooksPath: string,
 	configPath: string,
+	context: NativeHookCheckContext,
 ): Promise<Check> {
+	if (existsSync(configPath) && context.installMode === "plugin") {
+		try {
+			const configContent = await readFile(configPath, "utf-8");
+			if (configEnablesPluginScopedHooks(configContent)) {
+				return checkPluginScopedNativeHooks(context.codexHomeDir, hooksPath);
+			}
+		} catch {
+			// Fall through to the hooks.json checks; the dedicated config check will
+			// report read failures separately.
+		}
+	}
+
 	if (!existsSync(hooksPath)) {
 		if (existsSync(configPath)) {
 			try {
 				const configContent = await readFile(configPath, "utf-8");
-				const hasOmx =
-					configContent.includes("omx_") ||
-					configContent.includes("oh-my-codex");
-				if (hasOmx) {
+				if (context.installMode === "plugin") {
+					if (configHasOmxEntries(configContent)) {
+						return {
+							name: "Native hooks",
+							status: "warn",
+							message:
+								`plugin mode is using legacy native hook fallback, but expected setup-owned hooks.json is missing at ${hooksPath}; run "omx setup --plugin --force" to restore the fallback hook file, or upgrade Codex to plugin_hooks support so setup can use plugin-scoped hooks`,
+						};
+					}
+				}
+
+				if (configHasOmxEntries(configContent)) {
 					return {
 						name: "Native hooks",
 						status: "warn",
 						message:
-							'hooks.json not found even though config.toml has OMX entries; run "omx setup --force" to restore native hook coverage',
+							`expected setup-owned hooks.json is missing at ${hooksPath} even though config.toml has OMX entries; run "omx setup --force" to restore native hook coverage`,
 					};
 				}
 			} catch {
@@ -1039,6 +1349,210 @@ async function checkNativeHooks(
 			message: "cannot read hooks.json",
 		};
 	}
+}
+
+export async function checkNativeHookDistSmoke(
+	options: NativeHookDistSmokeOptions = {},
+): Promise<Check> {
+	const packageRoot = options.packageRoot ?? getPackageRoot();
+	const nodePath = options.nodePath ?? process.execPath;
+	const runner = options.runner ?? spawnSync;
+	const scriptPath = join(packageRoot, "dist", "scripts", "codex-native-hook.js");
+	const packageJsonPath = join(packageRoot, "package.json");
+	let packageVersion = "current";
+	try {
+		const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as { version?: unknown };
+		if (typeof packageJson.version === "string" && packageJson.version.trim()) {
+			packageVersion = packageJson.version.trim();
+		}
+	} catch {
+		// Keep the generic recovery copy when package metadata is not readable.
+	}
+
+	if (!existsSync(scriptPath)) {
+		return {
+			name: "Native hook dist smoke",
+			status: "fail",
+			message: `installed native hook script is missing at ${scriptPath}; reinstall oh-my-codex and run "omx setup --force"`,
+		};
+	}
+
+	const smokeCwd = await mkdtemp(join(tmpdir(), "omx-doctor-native-hook-dist-"));
+	try {
+		const payload = JSON.stringify({
+			hook_event_name: "UserPromptSubmit",
+			session_id: "omx-doctor-native-hook-dist-smoke",
+			transcript_path: join(smokeCwd, "nonexistent-transcript.jsonl"),
+			cwd: smokeCwd,
+			prompt: "doctor smoke test",
+		});
+		const result = runner(nodePath, [scriptPath], {
+			cwd: smokeCwd,
+			encoding: "utf-8",
+			env: {
+				...process.env,
+				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
+				OMX_ROOT: join(smokeCwd, ".omx-doctor-root"),
+				OMX_SESSION_ID: "omx-doctor-native-hook-dist-smoke",
+				OMX_SOURCE_CWD: smokeCwd,
+				OMX_STARTUP_CWD: smokeCwd,
+			},
+			input: payload,
+			timeout: 5_000,
+		});
+
+		if (result.error) {
+			return {
+				name: "Native hook dist smoke",
+				status: "fail",
+				message: `installed native hook dist smoke failed to run (${result.error.message}); reinstall oh-my-codex and run "omx setup --force"`,
+			};
+		}
+		if (result.status !== 0) {
+			const stderr = (result.stderr || "").trim();
+			const stdout = (result.stdout || "").trim();
+			const detail = stderr || stdout || `exit ${result.status}`;
+			return {
+				name: "Native hook dist smoke",
+				status: "fail",
+				message: `installed native hook dist failed a minimal UserPromptSubmit smoke (${detail}); reinstall with "npm install -g oh-my-codex@${packageVersion} --force --min-release-age=0 --before=" and then run "omx setup --force"`,
+			};
+		}
+
+		return {
+			name: "Native hook dist smoke",
+			status: "pass",
+			message:
+				"installed dist/scripts/codex-native-hook.js parsed and accepted a minimal UserPromptSubmit payload",
+		};
+	} finally {
+		await rm(smokeCwd, { recursive: true, force: true });
+	}
+}
+
+export function classifyPostCompactHookStdout(stdout: string): Check | null {
+	const trimmed = stdout.trim();
+	if (trimmed === "") return null;
+
+	try {
+		JSON.parse(trimmed);
+		return {
+			name: "Native PostCompact hook",
+			status: "fail",
+			message:
+				"PostCompact hook emitted JSON stdout, but OMX PostCompact must emit no stdout until Codex defines a supported PostCompact output contract; run \"omx setup --force\" after upgrading",
+		};
+	} catch (error) {
+		return {
+			name: "Native PostCompact hook",
+			status: "fail",
+			message: `PostCompact hook emitted invalid JSON stdout (${error instanceof Error ? error.message : String(error)}); run "omx setup --force" after upgrading`,
+		};
+	}
+}
+
+async function checkNativePostCompactHookRuntime(
+	hooksPath: string,
+	cwd: string,
+	codexHomeDir: string,
+): Promise<Check | null> {
+	if (!existsSync(hooksPath)) return null;
+
+	let content: string;
+	try {
+		content = await readFile(hooksPath, "utf-8");
+	} catch {
+		return null;
+	}
+
+	const postCompactCommands = getManagedCodexHookCommandsForEvent(
+		content,
+		"PostCompact",
+	);
+	if (postCompactCommands === null || postCompactCommands.length === 0) {
+		return null;
+	}
+
+	const expectedCommand = buildManagedCodexNativeHookCommand(getPackageRoot(), {
+		codexHomeDir,
+	});
+	const uniqueCommands = [...new Set(postCompactCommands)];
+	if (uniqueCommands.length !== 1 || uniqueCommands[0] !== expectedCommand) {
+		return {
+			name: "Native PostCompact hook",
+			status: "warn",
+			message:
+				"effective PostCompact OMX command does not match this installation's managed hook command; doctor skipped execution for safety, and \"omx setup --force\" should refresh stale hooks.json entries",
+		};
+	}
+
+	const smokeCwd = await mkdtemp(join(tmpdir(), "omx-doctor-postcompact-"));
+	try {
+		const payload = JSON.stringify({
+			hook_event_name: "PostCompact",
+			cwd: smokeCwd,
+			session_id: "omx-doctor-postcompact-smoke",
+		});
+		const result = spawnSync(expectedCommand, {
+			cwd,
+			encoding: "utf-8",
+			env: {
+				...process.env,
+				OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
+			},
+			input: payload,
+			shell: true,
+			timeout: 5_000,
+		});
+
+		if (result.error) {
+			return {
+				name: "Native PostCompact hook",
+				status: "fail",
+				message: `PostCompact hook smoke validation failed to run (${result.error.message})`,
+			};
+		}
+		if (result.status !== 0) {
+			const stderr = (result.stderr || "").trim();
+			return {
+				name: "Native PostCompact hook",
+				status: "fail",
+				message: `PostCompact hook smoke validation exited ${result.status}${stderr ? `: ${stderr}` : ""}`,
+			};
+		}
+
+		const stdoutCheck = classifyPostCompactHookStdout(result.stdout || "");
+		if (stdoutCheck) return stdoutCheck;
+
+		return {
+			name: "Native PostCompact hook",
+			status: "pass",
+			message:
+				"verbose smoke validation confirmed the effective PostCompact hook exits successfully with no stdout",
+		};
+	} finally {
+		await rm(smokeCwd, { recursive: true, force: true });
+	}
+}
+
+async function checkNativeHookRuntimeMirrors(
+	cwd: string,
+	hooksPath: string,
+): Promise<Check | null> {
+	if (!existsSync(hooksPath)) return null;
+
+	const discovery = await discoverCodexHookConfigPaths(cwd);
+	const runtimeMirrorCount = discovery.skipped.filter(
+		(entry) => entry.reason === "runtime_codex_home_mirror",
+	).length;
+	if (runtimeMirrorCount === 0) return null;
+
+	return {
+		name: "Native hook runtime mirrors",
+		status: "warn",
+		message:
+			`.omx/runtime/codex-home contains ${runtimeMirrorCount} hooks.json runtime mirror${runtimeMirrorCount === 1 ? "" : "s"} skipped by hook discovery; cleanup or relaunch so external hook review tools do not see duplicate native hook surfaces`,
+	};
 }
 
 async function checkPrompts(
@@ -1107,8 +1621,8 @@ async function checkLegacySkillRootOverlap(): Promise<Check> {
 	if (overlap.overlappingSkillNames.length === 0) {
 		return {
 			name: "Legacy skill roots",
-			status: "warn",
-			message: `legacy ~/.agents/skills still exists (${overlap.legacySkillCount} skills) alongside canonical ${overlap.canonicalDir}; remove or archive it if Codex shows duplicate entries`,
+			status: "pass",
+			message: `shared ~/.agents/skills exists (${overlap.legacySkillCount} skills) alongside canonical ${overlap.canonicalDir}; no duplicate skill names detected`,
 		};
 	}
 
@@ -1123,17 +1637,23 @@ async function checkLegacySkillRootOverlap(): Promise<Check> {
 	};
 }
 
-function getParsedMarketplaceRegistration(
-	content: string,
-): { source_type?: unknown; source?: unknown } | null {
+function getParsedPluginMarketplaceConfig(content: string): {
+	marketplace: { source_type?: unknown; source?: unknown } | null;
+	plugin: { enabled?: unknown } | null;
+} {
 	const parsed = parseToml(content) as {
 		marketplaces?: Record<string, { source_type?: unknown; source?: unknown }>;
+		plugins?: Record<string, { enabled?: unknown }>;
 	};
-	return parsed.marketplaces?.[OMX_LOCAL_MARKETPLACE_NAME] ?? null;
+	return {
+		marketplace: parsed.marketplaces?.[OMX_LOCAL_MARKETPLACE_NAME] ?? null,
+		plugin: parsed.plugins?.[OMX_LOCAL_PLUGIN_CONFIG_KEY] ?? null,
+	};
 }
 
 async function checkPluginMarketplaceRegistration(
 	configPath: string,
+	codexHomeDir: string,
 ): Promise<Check> {
 	const packagedMarketplace = await resolvePackagedOmxMarketplace(
 		getPackageRoot(),
@@ -1156,7 +1676,8 @@ async function checkPluginMarketplaceRegistration(
 
 	try {
 		const content = await readFile(configPath, "utf-8");
-		const registration = getParsedMarketplaceRegistration(content);
+		const { marketplace: registration, plugin } =
+			getParsedPluginMarketplaceConfig(content);
 		if (!registration) {
 			return {
 				name: "Skills",
@@ -1178,10 +1699,72 @@ async function checkPluginMarketplaceRegistration(
 				message: `Codex marketplace ${OMX_LOCAL_MARKETPLACE_NAME} points to ${String(registration.source)} (expected ${getPackageRoot()}); run "omx setup --plugin --force"`,
 			};
 		}
+		if (plugin?.enabled !== true) {
+			return {
+				name: "Skills",
+				status: "warn",
+				message: `Codex plugin ${OMX_LOCAL_PLUGIN_CONFIG_KEY} is not enabled; run "omx setup --plugin --force"`,
+			};
+		}
+
+		const [packagedManifestVersion, expectedSkillNames, cacheDirs] =
+			await Promise.all([
+				packagedOmxPluginVersion(packagedMarketplace),
+				expectedPackagedOmxSkillNames(packagedMarketplace),
+				discoverOmxPluginCacheDirs(codexHomeDir),
+			]);
+		if (!packagedManifestVersion) {
+			return {
+				name: "Skills",
+				status: "warn",
+				message: `packaged ${OMX_LOCAL_MARKETPLACE_NAME} plugin has no manifest version; reinstall oh-my-codex`,
+			};
+		}
+		if (!expectedSkillNames || expectedSkillNames.length === 0) {
+			return {
+				name: "Skills",
+				status: "warn",
+				message: `packaged ${OMX_LOCAL_MARKETPLACE_NAME} plugin has no skills mirror; reinstall oh-my-codex`,
+			};
+		}
+		const cacheStates = (
+			await Promise.all(cacheDirs.map((dir) => readOmxPluginCacheState(dir)))
+		).filter((state) => state !== null);
+		const packagedManifestSummary = {
+			manifestVersion: packagedManifestVersion,
+			skillNames: expectedSkillNames,
+		};
+		const readyCache = cacheStates.find(
+			(state) =>
+				state.manifestVersion === packagedManifestSummary.manifestVersion &&
+				state.skillsPointer === "./skills/" &&
+				JSON.stringify(state.skillNames) ===
+					JSON.stringify(packagedManifestSummary.skillNames),
+		);
+		if (!readyCache) {
+			const staleManifestCache = cacheStates.find(
+				(state) =>
+					state.skillsPointer === "./skills/" &&
+					JSON.stringify(state.skillNames) ===
+						JSON.stringify(packagedManifestSummary.skillNames) &&
+					state.manifestVersion !== packagedManifestSummary.manifestVersion,
+			);
+			const detail = staleManifestCache
+				? `installed Codex plugin cache manifest version ${String(staleManifestCache.manifestVersion)} does not match packaged version ${packagedManifestSummary.manifestVersion}`
+				: cacheStates.length === 0
+					? "no installed Codex plugin cache was found"
+					: "installed Codex plugin cache is missing the packaged skills mirror";
+			return {
+				name: "Skills",
+				status: "warn",
+				message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} is registered, but ${detail}; run "omx setup --plugin --force" so /skills can discover OMX plugin skills`,
+			};
+		}
+
 		return {
 			name: "Skills",
 			status: "pass",
-			message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} registered; OMX skills are supplied by ${packagedMarketplace.pluginRoot}`,
+			message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} registered; OMX skills are supplied by ${readyCache.cacheDir}`,
 		};
 	} catch {
 		return {
@@ -1193,12 +1776,122 @@ async function checkPluginMarketplaceRegistration(
 	}
 }
 
+const REQUIRED_NATIVE_REVIEWER_ROLES = ["architect", "critic"] as const;
+const ADVISORY_NATIVE_REVIEWER_ROLES = ["scholastic"] as const;
+
+type NativeReviewerRole =
+	| typeof REQUIRED_NATIVE_REVIEWER_ROLES[number]
+	| typeof ADVISORY_NATIVE_REVIEWER_ROLES[number];
+
+function getParsedAgentTables(
+	configPath: string,
+): Record<string, unknown> | null {
+	if (!existsSync(configPath)) return null;
+	try {
+		const parsed = parseToml(readFileSync(configPath, "utf-8")) as {
+			agents?: unknown;
+		};
+		return parsed.agents &&
+			typeof parsed.agents === "object" &&
+			!Array.isArray(parsed.agents)
+			? (parsed.agents as Record<string, unknown>)
+			: null;
+	} catch {
+		return null;
+	}
+}
+
+function configHasNativeReviewerRole(
+	configPath: string,
+	role: NativeReviewerRole,
+): boolean {
+	const agents = getParsedAgentTables(configPath);
+	if (!agents) return false;
+	const value = agents[role];
+	return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function agentTomlDefinesRole(path: string, role: NativeReviewerRole): boolean {
+	if (!existsSync(path)) return false;
+	try {
+		const parsed = parseToml(readFileSync(path, "utf-8")) as { name?: unknown };
+		if (typeof parsed.name === "string" && parsed.name.trim() !== "") {
+			return parsed.name.trim() === role;
+		}
+		return basename(path, ".toml") === role;
+	} catch {
+		return false;
+	}
+}
+
+function nativeReviewerRoleAvailable(
+	paths: DoctorPaths,
+	role: NativeReviewerRole,
+): boolean {
+	return agentTomlDefinesRole(join(paths.agentsDir, `${role}.toml`), role)
+		|| configHasNativeReviewerRole(paths.configPath, role);
+}
+
+function formatNativeRoleFileList(roles: readonly NativeReviewerRole[]): string {
+	const files = roles.map((role) => `${role}.toml`);
+	if (files.length <= 1) return files[0] ?? "";
+	return `${files.slice(0, -1).join(", ")} and ${files.at(-1)}`;
+}
+
+function checkNativeReviewerRoles(
+	paths: DoctorPaths,
+	installMode?: SetupInstallMode,
+): Check | null {
+	if (installMode !== "plugin") return null;
+
+	const missingRequired = REQUIRED_NATIVE_REVIEWER_ROLES.filter(
+		(role) => !nativeReviewerRoleAvailable(paths, role),
+	);
+	const missingAdvisory = ADVISORY_NATIVE_REVIEWER_ROLES.filter(
+		(role) => !nativeReviewerRoleAvailable(paths, role),
+	);
+
+	if (missingRequired.length > 0) {
+		const advisorySuffix = missingAdvisory.length > 0
+			? `; advisory role missing: ${missingAdvisory.join(", ")}`
+			: "";
+		return {
+			name: "Native reviewer roles",
+			status: "fail",
+			message:
+				`plugin mode supplies skills/hooks, but required RALPLAN/Autopilot native reviewer role(s) are unavailable: ${missingRequired.join(", ")}. ` +
+				`Install ${formatNativeRoleFileList(missingRequired)} under ${paths.agentsDir} or define equivalent [agents.<role>] entries in ${paths.configPath}; ` +
+				`otherwise role-specific subagent calls may degrade to prompt-only/default subagents${advisorySuffix}`,
+		};
+	}
+
+	if (missingAdvisory.length > 0) {
+		return {
+			name: "Native reviewer roles",
+			status: "warn",
+			message:
+				`required RALPLAN/Autopilot native reviewer roles are available (${REQUIRED_NATIVE_REVIEWER_ROLES.join(", ")}); ` +
+				`advisory ontology reviewer role(s) missing: ${missingAdvisory.join(", ")} (optional unless explicitly used)`,
+		};
+	}
+
+	return {
+		name: "Native reviewer roles",
+		status: "pass",
+		message:
+			`required RALPLAN/Autopilot native reviewer roles are available (${REQUIRED_NATIVE_REVIEWER_ROLES.join(", ")}); advisory ${ADVISORY_NATIVE_REVIEWER_ROLES.join(", ")} role is also available`,
+	};
+}
+
 async function checkSkills(
 	paths: DoctorPaths,
 	installMode?: SetupInstallMode,
 ): Promise<Check> {
 	if (installMode === "plugin") {
-		return checkPluginMarketplaceRegistration(paths.configPath);
+		return checkPluginMarketplaceRegistration(
+			paths.configPath,
+			paths.codexHomeDir,
+		);
 	}
 
 	const expectations = getCatalogExpectations();
@@ -1238,13 +1931,34 @@ function checkAgentsMd(
 	codexHomeDir: string,
 	installMode?: SetupInstallMode,
 ): Check {
+	const scopeFlag = scope === "project" ? "--scope project" : "--scope user";
+	const repairMessage =
+		`OMX AGENTS contract markers missing; file may have been overwritten by another tool. ` +
+		`Run "omx setup ${scopeFlag} --merge-agents" to preserve local guidance while restoring OMX-managed sections, ` +
+		`or "omx setup ${scopeFlag} --force" to replace it after backup.`;
+
 	if (scope === "user") {
 		const userAgentsMd = join(codexHomeDir, "AGENTS.md");
 		if (existsSync(userAgentsMd)) {
+			if (installMode === "plugin") {
+				return {
+					name: "AGENTS.md",
+					status: "pass",
+					message: `optional plugin-mode AGENTS.md defaults found in ${userAgentsMd}; contract validation skipped`,
+				};
+			}
+			const content = readFileSync(userAgentsMd, "utf-8");
+			if (!hasOmxAgentsContract(content)) {
+				return {
+					name: "AGENTS.md",
+					status: "warn",
+					message: `${repairMessage} Path: ${userAgentsMd}`,
+				};
+			}
 			return {
 				name: "AGENTS.md",
 				status: "pass",
-				message: `found in ${userAgentsMd}`,
+				message: `found OMX contract in ${userAgentsMd}`,
 			};
 		}
 		if (installMode === "plugin") {
@@ -1263,10 +1977,26 @@ function checkAgentsMd(
 
 	const projectAgentsMd = join(process.cwd(), "AGENTS.md");
 	if (existsSync(projectAgentsMd)) {
+		if (installMode === "plugin") {
+			return {
+				name: "AGENTS.md",
+				status: "pass",
+				message:
+					"optional plugin-mode AGENTS.md defaults found in project root; contract validation skipped",
+			};
+		}
+		const content = readFileSync(projectAgentsMd, "utf-8");
+		if (!hasOmxAgentsContract(content)) {
+			return {
+				name: "AGENTS.md",
+				status: "warn",
+				message: `${repairMessage} Path: ${projectAgentsMd}`,
+			};
+		}
 		return {
 			name: "AGENTS.md",
 			status: "pass",
-			message: "found in project root",
+			message: "found OMX contract in project root",
 		};
 	}
 	if (installMode === "plugin") {
@@ -1337,9 +2067,62 @@ function checkPromptTriage(): Check {
 	}
 }
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function pluginMcpServerEnabled(content: string, serverName: string): boolean | null {
+	const headerPattern = new RegExp(
+		`^\\s*\\[plugins\\.${escapeRegExp(JSON.stringify(OMX_LOCAL_PLUGIN_CONFIG_KEY))}\\.mcp_servers\\.${escapeRegExp(serverName)}\\]\\s*$`,
+	);
+	const lines = content.split(/\r?\n/);
+	const start = lines.findIndex((line) => headerPattern.test(line));
+	if (start < 0) return null;
+	for (let index = start + 1; index < lines.length; index += 1) {
+		const line = lines[index];
+		if (/^\s*\[/.test(line)) break;
+		const enabledMatch = line.match(/^\s*enabled\s*=\s*(true|false)\s*$/);
+		if (enabledMatch) return enabledMatch[1] === "true";
+	}
+	return null;
+}
+
+function describePluginMcpState(content: string, mcpMode?: SetupMcpMode): Check {
+	const states = OMX_FIRST_PARTY_MCP_SERVER_NAMES.map((serverName) =>
+		pluginMcpServerEnabled(content, serverName),
+	);
+	const enabledCount = states.filter((state) => state === true).length;
+	const disabledCount = states.filter((state) => state === false).length;
+	const missingCount = states.filter((state) => state === null).length;
+	const expectedEnabled = mcpMode === "compat";
+
+	if (expectedEnabled && missingCount === 0 && enabledCount === states.length) {
+		return {
+			name: "MCP Servers",
+			status: "pass",
+			message: `plugin MCP compatibility enabled by setup MCP mode compat (${enabledCount}/${states.length} first-party servers enabled)`,
+		};
+	}
+
+	if (!expectedEnabled && enabledCount === 0) {
+		return {
+			name: "MCP Servers",
+			status: "pass",
+			message: `CLI-first plugin mode: first-party MCP compatibility explicitly disabled (${enabledCount}/${states.length} first-party servers enabled; ${disabledCount} disabled, ${missingCount} omitted)`,
+		};
+	}
+
+	return {
+		name: "MCP Servers",
+		status: "warn",
+		message: `plugin MCP compatibility overrides are incomplete or mixed (enabled=${enabledCount}, disabled=${disabledCount}, missing=${missingCount}); run "omx setup --plugin --force --mcp ${mcpMode ?? "none"}" to repair`,
+	};
+}
+
 async function checkMcpServers(
 	configPath: string,
 	installMode?: SetupInstallMode,
+	mcpMode?: SetupMcpMode,
 ): Promise<Check> {
 	if (!existsSync(configPath)) {
 		if (installMode === "plugin") {
@@ -1367,34 +2150,29 @@ async function checkMcpServers(
 			};
 		}
 		if (installMode === "plugin") {
-			return {
-				name: "MCP Servers",
-				status: "pass",
-				message:
-					"plugin mode uses plugin-scoped MCP metadata; setup-owned OMX MCP tables are intentionally omitted",
-			};
+			return describePluginMcpState(content, mcpMode);
 		}
 		if (mcpCount > 0) {
 			const hasOmx = OMX_FIRST_PARTY_MCP_SERVER_NAMES.some((name) =>
-				content.includes(name),
+				content.includes(`[mcp_servers.${name}]`),
 			);
 			if (hasOmx) {
 				return {
 					name: "MCP Servers",
 					status: "pass",
-					message: `${mcpCount} servers configured (OMX present)`,
+					message: `${mcpCount} servers configured; first-party OMX MCP compatibility is explicitly present`,
 				};
 			}
 			return {
 				name: "MCP Servers",
-				status: "warn",
-				message: `${mcpCount} servers but no OMX servers yet (expected before first setup; run "omx setup --force" once)`,
+				status: "pass",
+				message: `${mcpCount} user-managed MCP server(s) preserved; first-party OMX MCP omitted by default`,
 			};
 		}
 		return {
 			name: "MCP Servers",
-			status: "warn",
-			message: "no MCP servers configured",
+			status: "pass",
+			message: "CLI-first default: no first-party OMX MCP servers configured",
 		};
 	} catch {
 		return {
