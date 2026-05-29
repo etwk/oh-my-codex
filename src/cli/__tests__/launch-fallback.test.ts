@@ -92,11 +92,84 @@ async function createLaunchFixture(
       OMX_AUTO_UPDATE: '0',
       OMX_NOTIFY_FALLBACK: '0',
       OMX_HOOK_DERIVED_SIGNALS: '0',
+      OMX_LAUNCH_POLICY: '',
+      OMX_ROOT: '',
+      OMX_STATE_ROOT: '',
+      OMXBOX_ACTIVE: '',
+      OMX_SOURCE_CWD: '',
+      OMX_MADMAX_DETACHED_CONTEXT: '',
     },
   };
 }
 
 describe('omx launch fallback when tmux is unavailable', () => {
+  it('surfaces direct Codex startup stderr and preserves the child exit code', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-child-error-'));
+    try {
+      const home = join(wd, 'home');
+      const fakeBin = join(wd, 'bin');
+
+      await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await writeExecutable(
+        join(fakeBin, 'codex'),
+        `#!/bin/sh
+printf 'codex-startup-boom\\n' >&2
+exit 42
+`,
+      );
+      await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
+
+      const result = runOmx(wd, ['--direct', '--version'], {
+        HOME: home,
+        PATH: `${fakeBin}:/usr/bin:/bin`,
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+        TMUX: '',
+        TMUX_PANE: '',
+      });
+
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+
+      assert.equal(result.status, 42, result.error || result.stderr || result.stdout);
+      assert.match(result.stderr, /codex-startup-boom/);
+      assert.match(result.stderr, /\[omx\] codex exited with code 42/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a missing Codex executable instead of exiting silently', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-missing-codex-'));
+    try {
+      const home = join(wd, 'home');
+      const fakeBin = join(wd, 'bin');
+
+      await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
+
+      const result = runOmx(wd, ['--direct', '--version'], {
+        HOME: home,
+        PATH: `${fakeBin}:/usr/bin:/bin`,
+        OMX_AUTO_UPDATE: '0',
+        OMX_NOTIFY_FALLBACK: '0',
+        OMX_HOOK_DERIVED_SIGNALS: '0',
+        TMUX: '',
+        TMUX_PANE: '',
+      });
+
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /failed to launch codex: executable not found in PATH/);
+      assert.notEqual(result.stderr.trim(), '');
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('launches codex directly without tmux ENOENT noise', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-fallback-'));
     try {
@@ -227,6 +300,191 @@ printf 'fake-codex:%s\n' "$*"
 });
 
 describe('omx launcher when tmux is available', () => {
+  it('reuses the same boxed madmax detached launch context instead of spawning duplicate tmux sessions', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-reuse-'));
+    try {
+      const runs = join(wd, 'runs');
+      const activeMarker = join(wd, 'active-session');
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V)
+    printf 'tmux 3.4\n'
+    exit 0
+    ;;
+  has-session)
+    test -f "${activeMarker}"
+    exit $?
+    ;;
+  new-session)
+    printf '%s\n' "$*" > "${activeMarker}"
+    printf 'leader-pane\n'
+    exit 0
+    ;;
+  split-window)
+    printf 'hud-pane\n'
+    exit 0
+    ;;
+  display-message)
+    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\n'
+    elif [ "$2" = '-p' ] && [ "$5" = '#{session_attached}' ]; then
+      printf '1\n'
+    else
+      printf '0\n'
+    fi
+    exit 0
+    ;;
+  show-options)
+    printf 'off\n'
+    exit 0
+    ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane)
+    exit 0
+    ;;
+esac
+exit 0
+`,
+      );
+
+      const baseEnv = {
+        ...env,
+        OMX_RUNS_DIR: runs,
+        OMXBOX_ACTIVE: '1',
+        OMX_MADMAX_DETACHED_CONTEXT: 'boxed-context-under-test',
+        OMX_LAUNCH_POLICY: 'direct',
+        TMUX: '',
+        TMUX_PANE: '',
+      };
+      const first = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(first.error)) return;
+      assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
+
+      const second = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(second.error)) return;
+      assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
+      assert.match(
+        second.stderr,
+        /madmax detached launch already active for this context; attaching .* instead of starting a duplicate/,
+      );
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 1);
+      assert.equal((tmuxLog.match(/tmux:has-session/g) || []).length, 1);
+      assert.equal((tmuxLog.match(/tmux:attach-session/g) || []).length, 2);
+      const activeRecords = await readFile(
+        join(runs, 'active-detached', 'boxed-context-under-test.json'),
+        'utf-8',
+      );
+      assert.match(activeRecords, /"tmux_session_name"/);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reuse the same active-detached lock for independent --madmax --high launches', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-independent-high-'));
+    try {
+      const runs = join(wd, 'runs');
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V) printf 'tmux 3.4\n'; exit 0 ;;
+  has-session) exit 1 ;;
+  new-session) printf 'leader-pane\n'; exit 0 ;;
+  split-window) printf 'hud-pane\n'; exit 0 ;;
+  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
+  show-options) printf 'off\n'; exit 0 ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
+esac
+exit 0
+`,
+      );
+      const baseEnv = {
+        ...env,
+        OMX_RUNS_DIR: runs,
+        OMX_LAUNCH_POLICY: 'direct',
+        TMUX: '',
+        TMUX_PANE: '',
+      };
+
+      const first = runOmx(wd, ['--madmax', '--high', '--tmux'], baseEnv);
+      const second = runOmx(wd, ['--madmax', '--high', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(first.error) || shouldSkipForSpawnPermissions(second.error)) return;
+      assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
+      assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
+      assert.doesNotMatch(first.stderr + second.stderr, /timed out waiting for madmax detached launch context lock/);
+      assert.doesNotMatch(second.stderr, /madmax detached launch already active for this context/);
+
+      const registryEntries = (await readFile(join(runs, 'registry.jsonl'), 'utf-8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { detached_launch_context: string });
+      assert.equal(registryEntries.length, 2);
+      assert.notEqual(
+        registryEntries[0]!.detached_launch_context,
+        registryEntries[1]!.detached_launch_context,
+        'independent launches must get distinct active-detached lock identities',
+      );
+      assert.equal(
+        existsSync(join(runs, 'active-detached', `${registryEntries[0]!.detached_launch_context}.json`)),
+        true,
+      );
+      assert.equal(
+        existsSync(join(runs, 'active-detached', `${registryEntries[1]!.detached_launch_context}.json`)),
+        true,
+      );
+
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 2);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('allows distinct madmax detached launch contexts to create separate sessions', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-distinct-'));
+    try {
+      const runs = join(wd, 'runs');
+      const { env, tmuxLogPath } = await createLaunchFixture(
+        wd,
+        (logPath) => `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${logPath}"
+case "$1" in
+  -V) printf 'tmux 3.4\n'; exit 0 ;;
+  has-session) exit 1 ;;
+  new-session) printf 'leader-pane\n'; exit 0 ;;
+  split-window) printf 'hud-pane\n'; exit 0 ;;
+  display-message) if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then printf '/tmp/tmux-test.sock\n'; else printf '0\n'; fi; exit 0 ;;
+  show-options) printf 'off\n'; exit 0 ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane) exit 0 ;;
+esac
+exit 0
+`,
+      );
+      const baseEnv = {
+        ...env,
+        OMX_RUNS_DIR: runs,
+        OMX_LAUNCH_POLICY: 'direct',
+        TMUX: '',
+        TMUX_PANE: '',
+      };
+      const first = runOmx(wd, ['--madmax', '--tmux'], baseEnv);
+      const second = runOmx(wd, ['--madmax', '--xhigh', '--tmux'], baseEnv);
+      if (shouldSkipForSpawnPermissions(first.error) || shouldSkipForSpawnPermissions(second.error)) return;
+      assert.equal(first.status, 0, first.error || first.stderr || first.stdout);
+      assert.equal(second.status, 0, second.error || second.stderr || second.stdout);
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 2);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('launches --madmax through explicitly requested detached tmux so HUD bootstrap can run', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-'));
     try {
@@ -305,6 +563,98 @@ exit 0
       assert.match(tmuxLog, /tmux:new-session .* -s /);
       assert.match(tmuxLog, new RegExp(`tmux:split-window -v -l ${HUD_TMUX_HEIGHT_LINES} .* -t `));
       assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves parent provider env for interactive OMX-created tmux without logging secret values', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-tmux-parent-env-'));
+    try {
+      const home = join(wd, 'home');
+      const fakeBin = join(wd, 'bin');
+      const envLogPath = join(wd, 'codex-env.log');
+      const tmuxLogPath = join(wd, 'tmux.log');
+
+      await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await writeExecutable(
+        join(fakeBin, 'codex'),
+        `#!/bin/sh
+{
+  printf 'custom=%s\n' "$CUSTOM_LLM_API_KEY"
+  printf 'marker=%s\n' "$IS_GAJAE_SLOP_GENERATOR"
+} > "${envLogPath}"
+exit 130
+`,
+      );
+      await writeExecutable(join(fakeBin, 'ps'), '#!/bin/sh\nexit 0\n');
+      await writeExecutable(
+        join(fakeBin, 'tmux'),
+        `#!/bin/sh
+printf 'tmux:%s\n' "$*" >> "${tmuxLogPath}"
+case "$1" in
+  -V)
+    printf 'tmux 3.4\\n'
+    exit 0
+    ;;
+  new-session)
+    last=''
+    for arg in "$@"; do last="$arg"; done
+    sh -c "$last" >/dev/null 2>&1 || true
+    printf 'leader-pane\\n'
+    exit 0
+    ;;
+  split-window)
+    printf 'hud-pane\\n'
+    exit 0
+    ;;
+  display-message)
+    if [ "$2" = '-p' ] && [ "$3" = '#{socket_path}' ]; then
+      printf '/tmp/tmux-test.sock\\n'
+    else
+      printf '0\\n'
+    fi
+    exit 0
+    ;;
+  show-options)
+    printf 'off\\n'
+    exit 0
+    ;;
+  set-option|set-hook|attach-session|kill-session|run-shell|resize-pane)
+    exit 0
+    ;;
+esac
+exit 0
+`,
+      );
+
+      const result = runOmx(
+        wd,
+        ['--tmux', '--madmax'],
+        {
+          HOME: home,
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+          OMX_AUTO_UPDATE: '0',
+          OMX_NOTIFY_FALLBACK: '0',
+          OMX_HOOK_DERIVED_SIGNALS: '0',
+          TMUX: '',
+          TMUX_PANE: '',
+          CUSTOM_LLM_API_KEY: 'fake-provider-key',
+          IS_GAJAE_SLOP_GENERATOR: '1',
+        },
+      );
+
+      if (shouldSkipForSpawnPermissions(result.error)) return;
+
+      assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+      assert.equal(
+        await readFile(envLogPath, 'utf-8'),
+        'custom=fake-provider-key\nmarker=1\n',
+      );
+      const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.doesNotMatch(tmuxLog, /fake-provider-key/);
+      assert.doesNotMatch(tmuxLog, /CUSTOM_LLM_API_KEY=/);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

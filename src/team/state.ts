@@ -3,7 +3,6 @@ import { join, dirname, resolve, sep } from 'path';
 import { existsSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { readUsableSessionState } from '../hooks/session.js';
-import { omxStateDir } from '../utils/paths.js';
 import { isTerminalPhase, type TeamPhase, type TerminalPhase } from './orchestrator.js';
 import {
   computeTaskReadiness as computeTaskReadinessImpl,
@@ -67,6 +66,7 @@ import {
 } from './contracts.js';
 import type { TeamReminderIntent } from './reminder-intents.js';
 import type { WorktreeMode } from './worktree.js';
+import { resolveCanonicalTeamStateRoot } from './state-root.js';
 
 export type { TeamDispatchRequestStatus, TeamWorkerIntegrationStatus } from './contracts.js';
 
@@ -583,11 +583,7 @@ function normalizeTask(task: TeamTask): TeamTaskV2 {
 
 // Team state directory: .omx/state/team/{teamName}/
 function resolveTeamStateRoot(cwd: string, env: NodeJS.ProcessEnv = process.env): string {
-  const explicit = env.OMX_TEAM_STATE_ROOT;
-  if (typeof explicit === 'string' && explicit.trim() !== '') {
-    return resolve(cwd, explicit.trim());
-  }
-  return omxStateDir(cwd);
+  return resolveCanonicalTeamStateRoot(cwd, env);
 }
 
 function assertSafeTeamName(teamName: string): void {
@@ -2135,7 +2131,7 @@ export async function markOwnedTeamsLeaderStopObserved(
   source: TeamLeaderAttentionState['source'] = 'native_stop',
 ): Promise<string[]> {
   if (!leaderSessionId.trim()) return [];
-  const teamsRoot = join(omxStateDir(cwd), 'team');
+  const teamsRoot = join(resolveTeamStateRoot(cwd), 'team');
   if (!existsSync(teamsRoot)) return [];
   const entries = await readdir(teamsRoot, { withFileTypes: true }).catch(() => []);
   const updatedTeams: string[] = [];

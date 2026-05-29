@@ -2,7 +2,11 @@ import {
   buildDocumentRefreshAdvisoryOutput,
   evaluateStagedDocumentRefresh,
 } from "../document-refresh/enforcer.js";
-import { isLoreCommitGuardEnabled } from "../config/commit-lore-guard.js";
+import {
+  OMX_LORE_COMMIT_GUARD_ENV,
+  isLoreCommitGuardEnabled,
+  readConfiguredLoreCommitGuardValue,
+} from "../config/commit-lore-guard.js";
 import { resolveCodexExecutionSurface } from "./codex-execution-surface.js";
 
 type CodexHookPayload = Record<string, unknown>;
@@ -103,8 +107,8 @@ export function normalizePostToolUsePayload(
   const exitCode = safeInteger(parsedToolResponse?.exit_code)
     ?? safeInteger(parsedToolResponse?.exitCode)
     ?? null;
-  const rawText = safeString(rawToolResponse).trim();
-  const stdoutText = safeString(parsedToolResponse?.stdout).trim() || rawText;
+  const rawToolResponseText = safeString(rawToolResponse).trim();
+  const stdoutText = safeString(parsedToolResponse?.stdout).trim() || rawToolResponseText;
   const stderrText = safeString(parsedToolResponse?.stderr).trim();
 
   return {
@@ -149,30 +153,49 @@ type OmxParityCommand =
   | "trace"
   | "code-intel";
 
+function joinNonEmptyText(parts: string[]): string {
+  return parts
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function structuredMcpTransportText(normalized: NormalizedPostToolUsePayload): string {
+  return joinNonEmptyText([
+    safeString(normalized.parsedToolResponse?.error),
+    safeString(normalized.parsedToolResponse?.message),
+    safeString(normalized.parsedToolResponse?.details),
+  ]);
+}
+
+function hasMcpTransportContext(text: string): boolean {
+  return /\bmcp\b/i.test(text)
+    || /\bomx-(?:state|memory|trace|code-intel)-server\b/i.test(text);
+}
+
+function hasMcpTransportFailurePattern(text: string): boolean {
+  return MCP_TRANSPORT_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 export function detectMcpTransportFailure(
   payload: CodexHookPayload,
 ): McpTransportFailureSignal | null {
   const normalized = normalizePostToolUsePayload(payload);
   if (normalized.isBash) return null;
-  const combined = [
+
+  const isMcpTool = isMcpLikeToolName(normalized.toolName);
+  const structuredText = structuredMcpTransportText(normalized);
+  const rawText = joinNonEmptyText([
     normalized.stderrText,
     normalized.stdoutText,
-    safeString(normalized.parsedToolResponse?.error),
-    safeString(normalized.parsedToolResponse?.message),
-    safeString(normalized.parsedToolResponse?.details),
-  ]
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+  ]);
+  const combined = isMcpTool
+    ? joinNonEmptyText([rawText, structuredText])
+    : structuredText;
 
-  const mcpContextDetected = isMcpLikeToolName(normalized.toolName)
-    || /\bmcp\b/i.test(combined)
-    || /\bomx-(?:state|memory|trace|code-intel)-server\b/i.test(combined);
-  if (!mcpContextDetected) return null;
   if (!combined) return null;
-  if (!MCP_TRANSPORT_FAILURE_PATTERNS.some((pattern) => pattern.test(combined))) {
-    return null;
-  }
+  if (!isMcpTool && !hasMcpTransportContext(structuredText)) return null;
+  if (!hasMcpTransportFailurePattern(combined)) return null;
 
   return {
     toolName: normalized.toolName,
@@ -185,7 +208,10 @@ function resolveOmxParityTarget(toolName: string): { command: OmxParityCommand; 
   if (!match) return null;
 
   const [, server, tool] = match;
-  if (server === "state") return { command: "state", tool };
+  if (server === "state") {
+    const stateTool = tool.replace(/^state_/, "").replace(/_/g, "-");
+    return { command: "state", tool: stateTool };
+  }
   if (server === "trace") return { command: "trace", tool };
   if (server === "code_intel") return { command: "code-intel", tool };
   if (server === "memory" && tool.startsWith("notepad_")) {
@@ -723,6 +749,17 @@ function buildEffectiveLoreCommitGuardEnv(parsed: GitCommitCommandParseResult): 
   for (const [name, value] of Object.entries(parsed.inlineEnvironment)) {
     if (typeof value === "string") effectiveEnvironment[name] = value;
   }
+
+  if (
+    !parsed.environmentStartsClean
+    && !parsed.unsetEnvironmentNames.includes(OMX_LORE_COMMIT_GUARD_ENV)
+    && typeof effectiveEnvironment[OMX_LORE_COMMIT_GUARD_ENV] !== "string"
+  ) {
+    const configuredValue = readConfiguredLoreCommitGuardValue(effectiveEnvironment);
+    if (typeof configuredValue === "string") {
+      effectiveEnvironment[OMX_LORE_COMMIT_GUARD_ENV] = configuredValue;
+    }
+  }
   return effectiveEnvironment;
 }
 
@@ -796,10 +833,13 @@ function buildGitCommitComplianceErrors(message: string | null): string[] {
   }
 
   const { bodyText, trailerLines } = splitBodyAndTrailerLines(lines.slice(2).join("\n"));
-  if (!bodyText) {
+  const hasLoreTrailer = trailerLines.some((line) =>
+    LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix))
+  );
+  if (!bodyText && !hasLoreTrailer) {
     errors.push("Add a narrative body paragraph explaining the decision context.");
   }
-  if (!trailerLines.some((line) => LORE_TRAILER_PREFIXES.some((prefix) => line.startsWith(prefix)))) {
+  if (!hasLoreTrailer) {
     errors.push("Add at least one Lore trailer such as `Constraint:`, `Confidence:`, or `Tested:`.");
   }
   return errors;
@@ -968,15 +1008,75 @@ function buildSloppyFallbackPreToolUseOutput(commandText: string): Record<string
   };
 }
 
-function commandInvokesOmxQuestion(command: string): boolean {
-  const tokens = tokenizeShellCommand(command)?.map((token) => token.toLowerCase()) ?? [];
-  for (let index = 0; index < tokens.length; index += 1) {
-    const rawToken = tokens[index] || '';
-    const token = rawToken.replace(/\\/g, '/').split('/').pop() || '';
-    if ((token === 'omx' || token === 'omx.js') && tokens[index + 1] === 'question') return true;
-    if ((token === 'node' || token === 'node.exe') && /(?:^|\/)omx\.js$/.test(tokens[index + 1] || '') && tokens[index + 2] === 'question') return true;
+function removeHereDocBodies(command: string): string {
+  const lines = command.split(/\r?\n/);
+  const retained: string[] = [];
+  let pendingDelimiter: string | null = null;
+
+  for (const line of lines) {
+    if (pendingDelimiter) {
+      if (line.trim() === pendingDelimiter) {
+        pendingDelimiter = null;
+      }
+      continue;
+    }
+
+    retained.push(line);
+    const match = /<<-?\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))/.exec(line);
+    if (match) pendingDelimiter = match[1] || match[2] || match[3] || null;
   }
-  return /\bomx\s+question\b/i.test(command) || /\bomx\.js['"]?\s+question\b/i.test(command);
+
+  return retained.join("\n");
+}
+
+function commandInvokesOmxQuestion(command: string): boolean {
+  const tokens = tokenizeShellCommandWithBoundaries(removeHereDocBodies(command))
+    ?.map((token) => ({ ...token, value: token.value.toLowerCase() }))
+    ?? [];
+
+  for (let commandStart = 0; commandStart < tokens.length; commandStart = nextCommandStart(tokens, commandStart)) {
+    const commandEnd = nextCommandStart(tokens, commandStart);
+    let index = commandStart;
+
+    while (index < commandEnd && isInlineShellEnvAssignment(tokens[index]?.value ?? "")) {
+      index += 1;
+    }
+
+    while (index < commandEnd && isEnvExecutableToken(tokens[index]?.value ?? "")) {
+      index += 1;
+      while (index < commandEnd) {
+        const token = tokens[index]?.value ?? "";
+        if (token === "--") {
+          index += 1;
+          break;
+        }
+        if (isInlineShellEnvAssignment(token)) {
+          index += 1;
+          continue;
+        }
+        if (token === "-i" || token === "--ignore-environment" || token.startsWith("--unset=")) {
+          index += 1;
+          continue;
+        }
+        if (token.startsWith("-")) {
+          index += envOptionConsumesNextValue(token) ? 2 : 1;
+          continue;
+        }
+        break;
+      }
+    }
+
+    const rawToken = tokens[index]?.value || "";
+    const token = rawToken.replace(/\\/g, "/").split("/").pop() || "";
+    if ((token === "omx" || token === "omx.js") && tokens[index + 1]?.value === "question") return true;
+    if (
+      (token === "node" || token === "node.exe")
+      && /(?:^|\/)omx\.js$/.test(tokens[index + 1]?.value || "")
+      && tokens[index + 2]?.value === "question"
+    ) return true;
+  }
+
+  return false;
 }
 
 function isQuestionReturnPaneAssignment(token: string): boolean {

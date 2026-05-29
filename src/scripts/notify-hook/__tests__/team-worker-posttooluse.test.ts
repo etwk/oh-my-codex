@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { chmod, mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -44,6 +44,33 @@ const successPayload = {
   tool_response: { exit_code: 0 },
   tool_use_id: 'tool-1',
 };
+
+const PROCESS_ENV_KEYS = [
+  'OMX_ROOT',
+  'OMX_STATE_ROOT',
+  'OMX_TEAM_STATE_ROOT',
+  'OMX_TEAM_WORKER',
+  'OMX_TEAM_INTERNAL_WORKER',
+] as const;
+
+const priorProcessEnv = new Map<(typeof PROCESS_ENV_KEYS)[number], string | undefined>();
+
+beforeEach(() => {
+  priorProcessEnv.clear();
+  for (const key of PROCESS_ENV_KEYS) {
+    priorProcessEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
+
+afterEach(() => {
+  for (const key of PROCESS_ENV_KEYS) {
+    const value = priorProcessEnv.get(key);
+    if (typeof value === 'string') process.env[key] = value;
+    else delete process.env[key];
+  }
+  priorProcessEnv.clear();
+});
 
 describe('handleTeamWorkerPostToolUseSuccess', () => {
   it('creates a safe worker checkpoint, ledger entries, leader signal, and dedupe marker', async () => {
@@ -138,9 +165,8 @@ describe('handleTeamWorkerPostToolUseSuccess', () => {
 
   it('unstages checkpointable paths when checkpoint commit fails after staging', async () => {
     const fixture = await initWorkerFixture();
-    const hookPath = join(fixture.cwd, '.git', 'hooks', 'prepare-commit-msg');
-    await writeFile(hookPath, '#!/bin/sh\nexit 42\n', 'utf-8');
-    await chmod(hookPath, 0o755);
+    execFileSync('git', ['config', 'user.email', ''], { cwd: fixture.cwd, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.name', ''], { cwd: fixture.cwd, stdio: 'ignore' });
     await writeFile(join(fixture.cwd, 'commit-fail.txt'), 'must not remain staged\n', 'utf-8');
 
     const result = await handleTeamWorkerPostToolUseSuccess(successPayload, fixture.cwd, fixture.env);

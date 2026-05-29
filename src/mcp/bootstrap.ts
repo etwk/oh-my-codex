@@ -3,7 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { resolveOmxFirstPartyMcpEntrypointForPluginTarget } from '../config/omx-first-party-mcp.js';
 import { writeMcpLifecycleTelemetry } from './lifecycle-telemetry.js';
 
-export type McpServerName = 'state' | 'memory' | 'code_intel' | 'trace' | 'wiki';
+export type McpServerName = 'state' | 'memory' | 'code_intel' | 'trace' | 'wiki' | 'hermes';
 
 const SERVER_DISABLE_ENV: Record<McpServerName, string> = {
   state: 'OMX_STATE_SERVER_DISABLE_AUTO_START',
@@ -11,6 +11,7 @@ const SERVER_DISABLE_ENV: Record<McpServerName, string> = {
   code_intel: 'OMX_CODE_INTEL_SERVER_DISABLE_AUTO_START',
   trace: 'OMX_TRACE_SERVER_DISABLE_AUTO_START',
   wiki: 'OMX_WIKI_SERVER_DISABLE_AUTO_START',
+  hermes: 'OMX_HERMES_SERVER_DISABLE_AUTO_START',
 };
 
 const GLOBAL_DISABLE_ENV = 'OMX_MCP_SERVER_DISABLE_AUTO_START';
@@ -66,6 +67,7 @@ const SERVER_ENTRYPOINT: Record<McpServerName, string> = {
   code_intel: 'code-intel-server.js',
   trace: 'trace-server.js',
   wiki: 'wiki-server.js',
+  hermes: 'hermes-server.js',
 };
 
 function normalizeCommand(command: string): string {
@@ -111,11 +113,99 @@ export function parseProcessTable(output: string): ProcessTableEntry[] {
     .filter((entry): entry is ProcessTableEntry => entry !== null);
 }
 
-export function listProcessTable(
-  readPs: typeof execFileSync = execFileSync,
-): ProcessTableEntry[] | null {
-  if (process.platform === 'win32') {
+const WINDOWS_PROCESS_TABLE_TIMEOUT_MS = 2_000;
+const WINDOWS_PROCESS_TABLE_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+type ProcessTableReader = typeof execFileSync;
+
+interface WindowsProcessRecord {
+  ProcessId?: unknown;
+  ParentProcessId?: unknown;
+  CommandLine?: unknown;
+  Name?: unknown;
+}
+
+function parsePositiveInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function parseNonNegativeInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+export function parseWindowsProcessTable(output: string): ProcessTableEntry[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output);
+  } catch {
     return null;
+  }
+
+  const records = Array.isArray(parsed) ? parsed : [parsed];
+  const entries: ProcessTableEntry[] = [];
+
+  for (const record of records) {
+    if (!record || typeof record !== 'object') continue;
+    const processRecord = record as WindowsProcessRecord;
+    const pid = parsePositiveInteger(processRecord.ProcessId);
+    const ppid = parseNonNegativeInteger(processRecord.ParentProcessId);
+    const rawCommand = typeof processRecord.CommandLine === 'string' && processRecord.CommandLine.trim()
+      ? processRecord.CommandLine
+      : typeof processRecord.Name === 'string'
+        ? processRecord.Name
+        : '';
+    const command = rawCommand.trim();
+
+    if (pid === null || ppid === null || !command) continue;
+    entries.push({ pid, ppid, command });
+  }
+
+  return entries;
+}
+
+function listWindowsProcessTable(
+  readProcessTable: ProcessTableReader,
+): ProcessTableEntry[] | null {
+  try {
+    const output = readProcessTable(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,Name | ConvertTo-Json -Compress',
+      ],
+      {
+        encoding: 'utf-8',
+        windowsHide: true,
+        timeout: WINDOWS_PROCESS_TABLE_TIMEOUT_MS,
+        maxBuffer: WINDOWS_PROCESS_TABLE_MAX_BUFFER_BYTES,
+      },
+    );
+    return parseWindowsProcessTable(output);
+  } catch {
+    return null;
+  }
+}
+
+export function listProcessTable(
+  readPs: ProcessTableReader = execFileSync,
+  platform: NodeJS.Platform = process.platform,
+): ProcessTableEntry[] | null {
+  if (platform === 'win32') {
+    return listWindowsProcessTable(readPs);
   }
 
   try {

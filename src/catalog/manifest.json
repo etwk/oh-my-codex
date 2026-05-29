@@ -90,6 +90,18 @@
       "status": "active"
     },
     {
+      "name": "prometheus-strict",
+      "category": "planning",
+      "status": "active",
+      "core": false
+    },
+    {
+      "name": "best-practice-research",
+      "category": "planning",
+      "status": "active",
+      "core": false
+    },
+    {
       "name": "analyze",
       "category": "shortcut",
       "status": "active"
@@ -148,10 +160,15 @@
       "canonical": "designer"
     },
     {
+      "name": "design",
+      "category": "shortcut",
+      "status": "active",
+      "canonical": "designer"
+    },
+    {
       "name": "frontend-ui-ux",
       "category": "shortcut",
-      "status": "alias",
-      "canonical": "designer"
+      "status": "deprecated"
     },
     {
       "name": "git-master",
@@ -429,7 +446,27 @@
       "canonical": "analyst"
     },
     {
+      "name": "prometheus-strict-metis",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
+      "name": "prometheus-strict-momus",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
+      "name": "prometheus-strict-oracle",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
       "name": "critic",
+      "category": "coordination",
+      "status": "active"
+    },
+    {
+      "name": "scholastic",
       "category": "coordination",
       "status": "active"
     },

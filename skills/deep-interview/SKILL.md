@@ -47,7 +47,7 @@ If no flag is provided, use **Standard**.
 - Do not rotate to a new clarity dimension just for coverage when the current answer is still vague; stay on the same thread until one layer deeper, one assumption clearer, or one boundary tighter
 - Before crystallizing, complete at least one explicit pressure pass that revisits an earlier answer with a deeper, assumption-focused, or tradeoff-focused follow-up
 - Gather codebase facts via `explore` before asking user about internals
-- When session guidance enables `USE_OMX_EXPLORE_CMD`, prefer `omx explore` for simple read-only brownfield fact gathering; keep prompts narrow and concrete, and keep ambiguous or non-shell-only investigation on the richer normal path and fall back normally if `omx explore` is unavailable.
+- `omx explore` is deprecated. Use normal repository inspection tools/subagents for simple read-only brownfield fact gathering; use `omx sparkshell` only for explicit shell-native read-only evidence, and keep ambiguous or non-shell-only investigation on the richer normal path.
 - Always run a preflight context intake before the first interview question
 - If initial context is oversized or would exceed the prompt budget, do not paste or forward the raw payload into interview prompts; request and record a prompt-safe initial-context summary first
 - The oversized initial-context summary gate is blocking: wait for the concise summary before ambiguity scoring, crystallizing artifacts, or any downstream execution handoff
@@ -56,6 +56,7 @@ If no flag is provided, use **Standard**.
 - Reduce user effort: ask only the highest-leverage unresolved question, and never ask the user for codebase facts that can be discovered directly
 - For brownfield work, prefer evidence-backed confirmation questions such as "I found X in Y. Should this change follow that pattern?"
 - Route facts before judgment in the Ouroboros style: before presenting a user-facing interview round, classify whether the needed information is a discoverable fact, a fact needing confirmation, or a human decision. The interview is with the human for judgment, not for facts the agent can inspect.
+- When unresolved ambiguity depends on current external best practices, official/upstream guidance, standards, or version-aware behavior, use `$best-practice-research` as the bounded evidence wrapper before crystallizing requirements or handing off to planning/execution.
 - Use these transcript/spec labels only; never use them as `omx question` `source` values, and never replace the runtime `source: "deep-interview"` contract for user-facing deep-interview questions:
   - `[from-code][auto-confirmed]` — exact, high-confidence codebase facts from manifests/configs or direct source evidence, with no prescription attached.
   - `[from-code]` — codebase findings that are useful but inferred, pattern-based, or low/medium confidence and therefore need a confirmation-style user-facing round before being treated as settled.
@@ -72,7 +73,7 @@ If no flag is provided, use **Standard**.
 - Do not hand off to execution while ambiguity remains above threshold unless user explicitly opts to proceed with warning
 - Do not crystallize or hand off while `Non-goals` or `Decision Boundaries` remain unresolved, even if the weighted ambiguity threshold is met
 - Treat early exit as a safety valve, not the default success path
-- Persist mode state for resume safety (`state_write` / `state_read`)
+- Persist mode state for resume safety with CLI-first state commands (`omx state write/read --input '<json>' --json`); use `state_write` / `state_read` only when explicit MCP compatibility is enabled
 </Execution_Policy>
 
 <Steps>
@@ -101,7 +102,7 @@ If no flag is provided, use **Standard**.
 2. Detect project context:
    - Run `explore` to classify **brownfield** (existing codebase target) vs **greenfield**.
    - For brownfield, collect relevant codebase context before questioning.
-3. Initialize state via `state_write(mode="deep-interview")`:
+3. Initialize state via `omx state write --input '{"mode":"deep-interview","active":true}' --json`:
 
 ```json
 {
@@ -286,7 +287,7 @@ Readiness gate:
 Show weighted breakdown table, readiness-gate status (`Non-goals`, `Decision Boundaries`), and the next focus dimension.
 
 ### 2e) Persist state
-Append round result and updated scores via `state_write`.
+Append round result and updated scores via `omx state write --input '<json>' --json`; use `state_write` only when explicit MCP compatibility is enabled.
 
 ### 2f) Round controls
 - Do not offer early exit before the first explicit assumption probe and one persistent follow-up have happened
@@ -369,7 +370,7 @@ Include these product-facing suggestions when they fit the clarified spec, witho
 - **`$autoresearch-goal`** — use when the clarified context is a research project: a research question, reference/literature gathering, evaluator-backed analysis, or professor/critic-style deliverable.
 - **`$performance-goal`** — use when the clarified context is an optimization or performance project with measurable speed, latency, throughput, memory, benchmark, or evaluator criteria.
 
-Preserve `$ralph` for persistent single-owner execution/verification and `$team` for coordinated parallel implementation. Present goal-mode options as context-sensitive next steps, not as generic replacements for implementation lanes.
+Recommend `$ultragoal` as the default durable goal-mode follow-up because it supersedes Ralph for goal tracking. Preserve `$team` for coordinated parallel implementation and keep `$ralph` only as an explicit fallback for persistent single-owner execution/verification when the user specifically selects it.
 
 ### 1. **`$ralplan` (Recommended)**
 - **Input Artifact:** `.omx/specs/deep-interview-{slug}.md` (optionally accompanied by the transcript/context snapshot for traceability)
@@ -378,7 +379,7 @@ Preserve `$ralph` for persistent single-owner execution/verification and `$team`
 - **Skipped / Already-Satisfied Stages:** Requirements discovery, ambiguity clarification, and early intent-boundary elicitation
 - **Expected Output:** Canonical planning artifacts under `.omx/plans/`, especially `prd-*.md` and `test-spec-*.md`
 - **Best When:** Requirements are clear enough to stop interviewing, but architectural validation / consensus planning is still desirable
-- **Next Recommended Step:** Use the approved planning artifacts with `$autopilot`, `$ralph`, `$team`, or `$ultragoal` as the default goal-mode follow-up; choose `$autoresearch-goal` for research validation or `$performance-goal` for measurable optimization
+- **Next Recommended Step:** Use the approved planning artifacts with `$ultragoal` as the default durable goal-mode follow-up (optionally with `$team` for parallel lanes); choose `$autoresearch-goal` for research validation or `$performance-goal` for measurable optimization, and use `$ralph` only as an explicit fallback when a narrow single-owner persistence loop is requested
 
 ### 2. **`$autopilot`**
 - **Input Artifact:** `.omx/specs/deep-interview-{slug}.md`
@@ -387,25 +388,25 @@ Preserve `$ralph` for persistent single-owner execution/verification and `$team`
 - **Skipped / Already-Satisfied Stages:** Initial requirement discovery and ambiguity reduction
 - **Expected Output:** Planning/execution progress, QA evidence, and validation artifacts produced by autopilot
 - **Best When:** The clarified spec is already strong enough for direct planning + execution without an additional consensus gate
-- **Next Recommended Step:** Continue through autopilot's execution/QA/validation flow; if coordination-heavy execution emerges, prefer a follow-up `$team` or `$ralph` lane as appropriate
+- **Next Recommended Step:** Continue through autopilot's execution/QA/validation flow; if coordination-heavy execution emerges, prefer `$team` under a leader-owned `$ultragoal` ledger, using `$ralph` only as an explicit fallback when a narrow single-owner persistence loop is requested
 
-### 3. **`$ralph`**
+### 3. **`$ralph` (Explicit fallback only)**
 - **Input Artifact:** `.omx/specs/deep-interview-{slug}.md`
 - **Invocation:** `$ralph <spec-path>`
 - **Consumer Behavior:** Use the spec's acceptance criteria and boundary constraints as the persistence target. Do not reopen requirements discovery unless the user explicitly asks to refine further.
 - **Skipped / Already-Satisfied Stages:** Requirement interview, ambiguity clarification, and initial scope-definition work
 - **Expected Output:** Iterative execution progress and verification evidence tracked against the clarified criteria
-- **Best When:** The task benefits from persistent sequential completion pressure and the user wants execution to keep moving until the criteria are satisfied or a real blocker exists
-- **Next Recommended Step:** Continue Ralph's persistence loop; if work expands into coordination-heavy lanes, hand off to `$team` and keep Ralph for verification continuity
+- **Best When:** The user explicitly asks for Ralph's persistent sequential completion pressure; otherwise use `$ultragoal` for durable goal tracking and completion checkpoints
+- **Next Recommended Step:** If this explicit fallback is selected, continue Ralph's persistence loop; if work expands into coordination-heavy lanes, hand off to `$team` under `$ultragoal` checkpointing rather than promoting Ralph as the next default
 
 ### 4. **`$team`**
 - **Input Artifact:** `.omx/specs/deep-interview-{slug}.md`
 - **Invocation:** `$team <spec-path>`
 - **Consumer Behavior:** Treat the spec as shared execution context for coordinated parallel work. Preserve the clarified intent, non-goals, decision boundaries, and acceptance criteria as common lane constraints.
 - **Skipped / Already-Satisfied Stages:** Requirement clarification and early ambiguity reduction
-- **Expected Output:** Coordinated multi-agent execution against the shared spec, with evidence that can later feed a Ralph verification pass when appropriate
+- **Expected Output:** Coordinated multi-agent execution against the shared spec, with evidence that can later feed Ultragoal checkpoints by default, or an explicit Ralph verification pass only when requested
 - **Best When:** The task is large, multi-lane, or blocker-sensitive enough to justify coordinated parallel execution instead of a single persistent loop
-- **Next Recommended Step:** Follow the team verification path when the coordinated execution phase finishes; escalate to a separate Ralph loop only when a later persistent verification/fix owner is still needed
+- **Next Recommended Step:** Follow the team verification path when the coordinated execution phase finishes; checkpoint completion through `$ultragoal` by default, escalating to a separate Ralph loop only when the user explicitly asks for that persistent verification/fix owner
 
 ### 5. **Refine further**
 - **Input Artifact:** Existing transcript, context snapshot, and current spec draft
@@ -428,7 +429,7 @@ Preserve `$ralph` for persistent single-owner execution/verification and `$team`
 - From attached-tmux Bash/tool paths, call it as `OMX_QUESTION_RETURN_PANE=$TMUX_PANE omx question ...` unless an explicit `%pane` return target is already known
 - If the current runtime is outside tmux and cannot render `omx question`, use native structured input when available; otherwise ask exactly one concise plain-text question and wait for the answer
 - After `omx question` returns JSON, prefer `answers[0].answer` / `answers[]`; use legacy `answer` only as a fallback for older records
-- Use `state_write` / `state_read` for resumable mode state
+- Use `omx state write/read --input '<json>' --json` for resumable mode state; `state_write` / `state_read` are explicit MCP compatibility fallbacks only
 - If the interview cannot ask a required `omx question` round, persist the blocker as terminal state with `active: false` and `current_phase: "blocked"`; do not write a terminal blocked phase with `active: true`
 - Read/write context snapshots under `.omx/context/`
 - Record whether the oversized-context summary gate is not needed, pending, or satisfied before any scoring or handoff step
@@ -461,6 +462,16 @@ Preserve `$ralph` for persistent single-owner execution/verification and `$team`
 <Advanced>
 ## Suggested Config (optional)
 
+Deep-interview reads runtime defaults from the first existing config source in this order:
+
+1. Repository-local `.omx/config.toml`
+2. Repository-root `omx.toml`
+3. User-global `~/.omx/config.toml`
+
+This section is currently a deep-interview-specific runtime override surface, not a general replacement for Codex `config.toml` or `.omx-config.json` model/env routing.
+Malformed config files are ignored fail-soft so `$deep-interview` activation can continue with built-in defaults.
+Explicit `--quick`, `--standard`, or `--deep` invocation flags override `defaultProfile`.
+
 ```toml
 [omx.deepInterview]
 defaultProfile = "standard"
@@ -475,7 +486,7 @@ enableChallengeModes = true
 
 ## Resume
 
-If interrupted, rerun `$deep-interview`. Resume from persisted mode state via `state_read(mode="deep-interview")`.
+If interrupted, rerun `$deep-interview`. Resume from persisted mode state via `omx state read --input '{"mode":"deep-interview"}' --json`.
 
 ## Recommended 3-Stage Pipeline
 
@@ -487,5 +498,3 @@ deep-interview -> ralplan -> autopilot
 - Stage 2 (ralplan): feasibility + architecture gate
 - Stage 3 (autopilot): execution + QA + validation gate
 </Advanced>
-
-Task: {{ARGUMENTS}}

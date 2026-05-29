@@ -181,35 +181,7 @@ function buildRalphApprovedContextLines(approvedHint: ApprovedExecutionLaunchHin
     lines.push('Approved repository context summary (bounded, inspectable):');
     lines.push(approvedHint.repositoryContextSummary.content);
   }
-  if (approvedHint.contextPackStatus === 'ready') {
-    return lines;
-  }
-  if (approvedHint.contextPackStatus === 'plan-only') {
-    lines.push('- context pack: not declared in the approved plan; using the pre-context-pack plan-only handoff baseline.');
-    lines.push('- Plan-only fallback: use the approved plan, matching test specs, and any deep-interview artifacts as repair inputs; do not treat this as approved context-bearing execution.');
-    return lines;
-  }
-  if (approvedHint.contextPackStatus === 'incomplete') {
-    if (approvedHint.contextPackIssues.length > 0) {
-      lines.push(`- incomplete context pack issues: ${approvedHint.contextPackIssues.join(' | ')}`);
-    }
-    if (approvedHint.missingRequiredContextPackRoles.length > 0) {
-      lines.push(`- missing required context roles: ${approvedHint.missingRequiredContextPackRoles.join(', ')}`);
-    }
-    lines.push('- Incomplete-pack fallback: use the approved plan, matching test specs, and any deep-interview artifacts only as repair inputs; repair or recreate the canonical context pack with required role coverage before broadening context.');
-    return lines;
-  }
-  if (approvedHint.contextPackStatus === 'invalid') {
-    if (approvedHint.contextPackIssues.length > 0) {
-      lines.push(`- invalid context pack issues: ${approvedHint.contextPackIssues.join(' | ')}`);
-    }
-    lines.push('- Invalid-pack fallback: use the approved plan, matching test specs, and any deep-interview artifacts only as repair inputs; repair or recreate the canonical context pack before broadening context.');
-    return lines;
-  }
-  if (approvedHint.contextPackIssues.length > 0) {
-    lines.push(`- missing-baseline issues: ${approvedHint.contextPackIssues.join(' | ')}`);
-  }
-  lines.push('- Missing-baseline fallback: the latest approved plan is missing its matching test spec, so use the surfaced plan as lineage guidance only and restore the missing baseline before broadening context.');
+  lines.push('- Approved execution baseline is ready: use the approved plan, matching test specs, and any deep-interview artifacts as execution inputs.');
   return lines;
 }
 
@@ -281,6 +253,7 @@ export function buildRalphAppendInstructions(
     '- Treat any active goal objective as the top-level completion contract for this Ralph run; Ralph mode state is not proof of goal completion by itself.',
     '- Call `create_goal` only when the user/system explicitly requested a new goal and `get_goal` reports no active goal; otherwise do not invent a goal.',
     '- Before completion, build a prompt-to-artifact checklist, inspect real evidence for every requirement, and continue working if any item is missing, incomplete, weakly verified, or uncovered.',
+    '- Record Ralph completion evidence in state before final Stop/cleanup: `completion_audit.passed=true`, a non-empty `completion_audit.prompt_to_artifact_checklist`, and non-empty `completion_audit.verification_evidence` (or point `completion_audit_path`/`completion_audit_evidence_path` at a repo-relative JSON artifact with those fields).',
     '- Call `update_goal({status: "complete"})` only after that audit proves the active objective is fully achieved; then report final elapsed time and token-budget usage when provided.',
     'Final deslop guidance:',
     options.noDeslop

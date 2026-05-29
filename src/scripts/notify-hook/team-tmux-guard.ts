@@ -134,6 +134,7 @@ export async function sendPaneInput({
   submitKeyPresses = 2,
   submitDelayMs = 0,
   typePrompt = true,
+  queueFirstSubmit = false,
 }: any): Promise<any> {
   const target = safeString(paneTarget).trim();
   if (!target) {
@@ -163,6 +164,12 @@ export async function sendPaneInput({
     if (typePrompt) {
       await runProcess('tmux', argv.typeArgv, 3000);
     }
+    if (queueFirstSubmit && argv.submitArgv.length > 0) {
+      await runProcess('tmux', ['send-keys', '-t', target, 'Tab'], 3000);
+      if (submitDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
+      }
+    }
     for (const submit of argv.submitArgv) {
       if (submitDelayMs > 0) {
         await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
@@ -177,6 +184,48 @@ export async function sendPaneInput({
       reason: 'send_failed',
       paneTarget: target,
       argv,
+      error: error instanceof Error ? error.message : safeString(error),
+    };
+  }
+}
+
+export async function queuePaneInput({
+  paneTarget,
+  prompt,
+  submitDelayMs = 80,
+}: any): Promise<any> {
+  const sendResult = await sendPaneInput({
+    paneTarget,
+    prompt,
+    submitKeyPresses: 0,
+  });
+  if (!sendResult.ok) return sendResult;
+
+  const target = safeString(paneTarget).trim();
+  const submitArgv = [
+    ['send-keys', '-t', target, 'Tab'],
+    ['send-keys', '-t', target, 'C-m'],
+  ];
+  try {
+    await runProcess('tmux', submitArgv[0], 3000);
+    if (submitDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, submitDelayMs));
+    }
+    await runProcess('tmux', submitArgv[1], 3000);
+    return {
+      ok: true,
+      sent: true,
+      reason: 'queued',
+      paneTarget: target,
+      argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      sent: false,
+      reason: 'queue_failed',
+      paneTarget: target,
+      argv: { typeArgv: sendResult.argv?.typeArgv || null, submitArgv },
       error: error instanceof Error ? error.message : safeString(error),
     };
   }

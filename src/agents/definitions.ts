@@ -7,7 +7,7 @@
 export interface AgentDefinition {
   name: string;
   description: string;
-  reasoningEffort: 'low' | 'medium' | 'high';
+  reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh';
   posture: 'frontier-orchestrator' | 'deep-worker' | 'fast-lane';
   modelClass: 'frontier' | 'standard' | 'fast';
   routingRole: 'leader' | 'specialist' | 'executor';
@@ -74,7 +74,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'architect': {
     name: 'architect',
     description: 'System design, boundaries, interfaces, long-horizon tradeoffs',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -158,7 +158,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'code-reviewer': {
     name: 'code-reviewer',
     description: 'Comprehensive review across all concerns',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -311,9 +311,51 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   },
 
   // Coordination
+
+  'prometheus-strict-metis': {
+    name: 'prometheus-strict-metis',
+    description: 'Prometheus Strict requirements interviewer and ambiguity mapper',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-momus': {
+    name: 'prometheus-strict-momus',
+    description: 'Prometheus Strict adversarial plan critic and risk challenger',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+  'prometheus-strict-oracle': {
+    name: 'prometheus-strict-oracle',
+    description: 'Prometheus Strict implementation readiness verifier and handoff judge',
+    reasoningEffort: 'high',
+    posture: 'frontier-orchestrator',
+    modelClass: 'standard',
+    routingRole: 'leader',
+    tools: 'analysis',
+    category: 'coordination',
+  },
+
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',
+    reasoningEffort: 'xhigh',
+    posture: 'frontier-orchestrator',
+    modelClass: 'frontier',
+    routingRole: 'leader',
+    tools: 'read-only',
+    category: 'coordination',
+  },
+  'scholastic': {
+    name: 'scholastic',
+    description: 'Ontology-first reasoning reviewer: category mistakes, hidden assumptions, modality separation, scholastic critique, and minimal-repair proposals',
     reasoningEffort: 'high',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',

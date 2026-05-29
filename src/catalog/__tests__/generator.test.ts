@@ -51,11 +51,17 @@ describe('catalog reader/contract', () => {
     assert.ok(contract.skills.some((s) => s.name === 'ask-gemini' && s.status === 'deprecated' && !s.canonical));
     assert.ok(contract.skills.some((s) => s.name === 'ai-slop-cleaner' && s.status === 'active'));
     assert.ok(contract.skills.some((s) => s.name === 'visual-ralph' && s.status === 'active'));
+    assert.ok(contract.skills.some((s) => s.name === 'design' && s.status === 'active' && s.canonical === 'designer'));
+    assert.ok(contract.skills.some((s) => s.name === 'frontend-ui-ux' && s.status === 'deprecated' && !s.canonical));
     assert.ok(
       contract.skills.some(
         (s) => s.name === 'web-clone' && s.status === 'deprecated' && !s.canonical,
       ),
     );
+    assert.ok(contract.skills.some((s) => s.name === 'prometheus-strict' && s.status === 'active'));
+    assert.ok(contract.agents.some((a) => a.name === 'prometheus-strict-metis' && a.status === 'active'));
+    assert.ok(contract.agents.some((a) => a.name === 'prometheus-strict-momus' && a.status === 'active'));
+    assert.ok(contract.agents.some((a) => a.name === 'prometheus-strict-oracle' && a.status === 'active'));
   });
 
   it('template manifest can be synced from source manifest', async () => {

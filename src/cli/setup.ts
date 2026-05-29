@@ -12,6 +12,7 @@ import {
 	rename,
 	writeFile,
 	stat,
+	lstat,
 	rm,
 } from "fs/promises";
 import { join, dirname, relative, basename } from "path";
@@ -33,9 +34,13 @@ import {
 import {
 	buildMergedConfig,
 	getRootModelName,
+	getRootTomlArray,
 	hasLegacyOmxTeamRunTable,
+	isOmxManagedNotifyCommand,
+	sanitizePreviousNotifyCommand,
 	stripExistingOmxBlocks,
 	stripExistingSharedMcpRegistryBlock,
+	mergeSharedMcpRegistryBlock,
 	stripOmxEnvSettings,
 	stripOmxFeatureFlags,
 	stripOmxSeededBehavioralDefaults,
@@ -43,8 +48,18 @@ import {
 	upsertManagedCodexHookTrustState,
 	stripManagedCodexHookTrustState,
 	OMX_PLUGIN_DEVELOPER_INSTRUCTIONS,
+	hasFirstPartyOmxMcpRegistrations,
+	extractFirstPartyOmxMcpSections,
+	stripFirstPartyOmxMcpSections,
 } from "../config/generator.js";
-import { mergeManagedCodexHooksConfig } from "../config/codex-hooks.js";
+import type { CodexHookFeatureFlag } from "../config/codex-feature-flags.js";
+import {
+	buildManagedCodexHookTrustState,
+	buildManagedCodexNativeHookWindowsShimContent,
+	buildManagedCodexNativeHookWindowsShimPath,
+	mergeManagedCodexHooksConfig,
+	removeManagedCodexHooks,
+} from "../config/codex-hooks.js";
 import {
 	getLegacyUnifiedMcpRegistryCandidate,
 	getUnifiedMcpRegistryCandidates,
@@ -67,6 +82,7 @@ import { tryReadCatalogManifest } from "../catalog/reader.js";
 import { DEFAULT_FRONTIER_MODEL } from "../config/models.js";
 import {
 	addGeneratedAgentsMarker,
+	hasOmxAgentsContract,
 	hasOmxManagedAgentsSections,
 	isOmxGeneratedAgentsMd,
 	upsertManagedAgentsBlock,
@@ -74,18 +90,26 @@ import {
 import { DEFAULT_HUD_CONFIG, type HudPreset } from "../hud/types.js";
 import {
 	SETUP_INSTALL_MODES,
+	SETUP_MCP_MODES,
 	SETUP_SCOPES,
 	getSetupScopeFilePath,
 	readPersistedSetupPreferences,
 	type PersistedSetupScope,
 	type SetupInstallMode,
+	type SetupMcpMode,
 	type SetupScope,
 } from "./setup-preferences.js";
 import {
 	OMX_LOCAL_MARKETPLACE_NAME,
+	OMX_PLUGIN_NAME,
+	materializePackagedOmxPluginCache,
 	resolvePackagedOmxMarketplace,
 	upsertLocalOmxMarketplaceRegistration,
+	upsertLocalOmxPluginEnablement,
+	upsertLocalOmxPluginMcpServerEnablement,
+	hasLocalOmxPluginMcpServerRegistrations,
 } from "./plugin-marketplace.js";
+import { resolveCodexHookFeatureSupportForCli } from "./codex-feature-probe.js";
 
 async function resolveStatusLinePresetForSetup(
 	projectRoot: string,
@@ -115,11 +139,13 @@ import {
 } from "../utils/agents-model-table.js";
 
 interface SetupOptions {
+	codexFeaturesProbe?: () => string | null;
 	codexVersionProbe?: () => string | null;
 	force?: boolean;
 	mergeAgents?: boolean;
 	dryRun?: boolean;
 	installMode?: SetupInstallMode;
+	mcpMode?: SetupMcpMode;
 	scope?: SetupScope;
 	verbose?: boolean;
 	agentsOverwritePrompt?: (destinationPath: string) => Promise<boolean>;
@@ -139,11 +165,15 @@ interface SetupOptions {
 	pluginDeveloperInstructionsOverwritePrompt?: (
 		configPath: string,
 	) => Promise<boolean>;
+	firstPartyMcpRemovalPrompt?: (
+		configPath: string,
+		registrationKinds: string[],
+	) => Promise<boolean>;
 	mcpRegistryCandidates?: string[];
 }
 
-export { SETUP_INSTALL_MODES, SETUP_SCOPES };
-export type { SetupInstallMode, SetupScope };
+export { SETUP_INSTALL_MODES, SETUP_MCP_MODES, SETUP_SCOPES };
+export type { SetupInstallMode, SetupMcpMode, SetupScope };
 
 export interface ScopeDirectories {
 	codexConfigFile: string;
@@ -204,6 +234,7 @@ const PROJECT_GITIGNORE_ENTRIES = [
 ] as const;
 const LEGACY_PROJECT_GITIGNORE_ENTRIES = [".codex/"] as const;
 const SETUP_ONLY_INSTALLABLE_SKILLS = new Set(["wiki"]);
+const DEFAULT_SETUP_MCP_MODE: SetupMcpMode = "none";
 const HARD_DEPRECATED_SKILL_NAMES = new Set(["web-clone"]);
 
 function isCatalogInstallableStatus(status: string | undefined): boolean {
@@ -244,7 +275,7 @@ function applyPluginModeWordingToAgentsTemplate(
 			: "`~/.codex/skills`";
 	return scopedContent.replace(
 		/Role prompts under `prompts\/\*\.md` are narrower execution surfaces\. They must follow this file, not override it\.\nWhen OMX is installed, load the installed prompt\/skill\/agent surfaces from [^\n]+active\)\./,
-		`Registered Codex plugin marketplace surfaces supply OMX workflows, prompts, and native-agent roles when the plugin is installed. They must follow this file, not override it.\nUser-installed skills may still live under ${userSkillPath}. Setup-owned prompt files and native-agent TOML defaults are intentionally omitted in plugin mode unless explicitly installed.`,
+		`Registered Codex plugin marketplace surfaces supply OMX workflows and plugin-scoped companion resources when the plugin is installed. Native agent roles are installed as setup-owned Codex agent TOML files in plugin mode so agent_type routing works. They must follow this file, not override it.\nUser-installed skills may still live under ${userSkillPath}.`,
 	);
 }
 
@@ -256,6 +287,11 @@ interface ResolvedSetupScope {
 interface ResolvedSetupInstallMode {
 	installMode: SetupInstallMode;
 	source: "cli" | "persisted" | "prompt" | "default";
+}
+
+interface ResolvedSetupMcpMode {
+	mcpMode: SetupMcpMode;
+	source: "cli" | "persisted" | "default";
 }
 
 type PersistedSetupReviewDecision = "keep" | "review" | "reset";
@@ -612,6 +648,35 @@ async function promptForSetupInstallMode(
 	}
 }
 
+async function promptForFirstPartyMcpRemoval(
+	configPath: string,
+	registrationKinds: string[],
+): Promise<boolean> {
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		return false;
+	}
+	const rl = createInterface({
+		input: process.stdin,
+		output: process.stdout,
+	});
+	try {
+		console.log("Deprecated first-party OMX MCP registration detected:");
+		console.log(`  ${configPath}`);
+		console.log(`  ${registrationKinds.join(", ")}`);
+		console.log(
+			"  OMX is CLI-first by default now; first-party MCP compatibility is legacy/explicit.",
+		);
+		const answer = (
+			await rl.question("Remove first-party OMX MCP registrations now? [y/N]: ")
+		)
+			.trim()
+			.toLowerCase();
+		return answer === "y" || answer === "yes";
+	} finally {
+		rl.close();
+	}
+}
+
 function hasPersistedSetupPreferences(
 	preferences: Partial<PersistedSetupScope> | undefined,
 ): preferences is Partial<PersistedSetupScope> {
@@ -624,6 +689,7 @@ function formatPersistedSetupPreferenceSummary(
 	return [
 		`scope=${preferences.scope ?? "not recorded"}`,
 		`installMode=${preferences.installMode ?? "not recorded"}`,
+		`mcpMode=${preferences.mcpMode ?? "not recorded"}`,
 	].join(", ");
 }
 
@@ -834,6 +900,7 @@ interface OmxPluginCacheManifest {
 	name: string | null;
 	version: string | null;
 	skills: string | null;
+	hooks: string | null;
 }
 
 async function readPluginManifestSummary(
@@ -846,11 +913,13 @@ async function readPluginManifestSummary(
 			name?: unknown;
 			version?: unknown;
 			skills?: unknown;
+			hooks?: unknown;
 		};
 		return {
 			name: typeof manifest.name === "string" ? manifest.name : null,
 			version: typeof manifest.version === "string" ? manifest.version : null,
 			skills: typeof manifest.skills === "string" ? manifest.skills : null,
+			hooks: typeof manifest.hooks === "string" ? manifest.hooks : null,
 		};
 	} catch {
 		return null;
@@ -929,6 +998,7 @@ interface PluginDiscoveryCacheRefreshResult {
 async function refreshOmxPluginDiscoveryCache(
 	pkgRoot: string,
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
+	codexHomeDir = codexHome(),
 ): Promise<PluginDiscoveryCacheRefreshResult> {
 	const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
 	if (!packagedMarketplace) {
@@ -940,7 +1010,7 @@ async function refreshOmxPluginDiscoveryCache(
 			JSON.parse(raw) as { version?: unknown },
 		),
 		listChildDirectoryNames(join(packagedMarketplace.pluginRoot, "skills")),
-		discoverOmxPluginCacheDirs(),
+		discoverOmxPluginCacheDirs(join(codexHomeDir, "plugins", "cache")),
 	]);
 	const expectedVersion = typeof pkg.version === "string" ? pkg.version : null;
 	const staleDirs: string[] = [];
@@ -955,12 +1025,22 @@ async function refreshOmxPluginDiscoveryCache(
 		const versionChanged =
 			expectedVersion !== null && manifest.version !== expectedVersion;
 		const skillsPointerChanged = manifest.skills !== "./skills/";
+		const hooksPointerChanged = manifest.hooks !== "./hooks/hooks.json";
+		const hookFilesMissing = !existsSync(join(cacheDir, "hooks", "hooks.json"))
+			|| !existsSync(join(cacheDir, "hooks", "codex-native-hook.mjs"))
+			|| !existsSync(join(cacheDir, "hooks", "omx-command.json"));
 		const skillListChanged =
 			expectedSkillNames !== null &&
 			cachedSkillNames !== null &&
 			JSON.stringify(cachedSkillNames) !== JSON.stringify(expectedSkillNames);
 
-		if (!versionChanged && !skillsPointerChanged && !skillListChanged) continue;
+		if (
+			!versionChanged &&
+			!skillsPointerChanged &&
+			!hooksPointerChanged &&
+			!hookFilesMissing &&
+			!skillListChanged
+		) continue;
 
 		staleDirs.push(cacheDir);
 		if (!options.dryRun) {
@@ -974,6 +1054,10 @@ async function refreshOmxPluginDiscoveryCache(
 				skillsPointerChanged
 					? `skills pointer ${manifest.skills ?? "missing"} -> ./skills/`
 					: null,
+				hooksPointerChanged
+					? `hooks pointer ${manifest.hooks ?? "missing"} -> ./hooks/hooks.json`
+					: null,
+				hookFilesMissing ? "plugin hook files missing" : null,
 				skillListChanged ? "skill directory list changed" : null,
 			].filter(Boolean);
 			console.log(
@@ -986,6 +1070,26 @@ async function refreshOmxPluginDiscoveryCache(
 		status: staleDirs.length > 0 ? "refreshed" : "unchanged",
 		staleDirs,
 	};
+}
+
+
+function resolveSetupMcpMode(
+	scope: SetupScope,
+	requestedMcpMode: SetupMcpMode | undefined,
+	persistedReviewDecision: PersistedSetupReviewDecision,
+	persistedPreferences?: Partial<PersistedSetupScope>,
+): ResolvedSetupMcpMode {
+	if (requestedMcpMode) {
+		return { mcpMode: requestedMcpMode, source: "cli" };
+	}
+	if (
+		persistedPreferences?.mcpMode &&
+		persistedReviewDecision === "keep" &&
+		persistedPreferences.scope === scope
+	) {
+		return { mcpMode: persistedPreferences.mcpMode, source: "persisted" };
+	}
+	return { mcpMode: DEFAULT_SETUP_MCP_MODE, source: "default" };
 }
 
 async function resolveSetupInstallMode(
@@ -1207,75 +1311,6 @@ async function cleanupPluginModeLegacyPrompts(
 	return summary;
 }
 
-async function cleanupPluginModeLegacyNativeAgents(
-	pkgRoot: string,
-	agentsDir: string,
-	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
-): Promise<SetupCategorySummary> {
-	const summary = createEmptyCategorySummary();
-	if (!existsSync(agentsDir)) return summary;
-
-	const manifest = tryReadCatalogManifest();
-	const agentStatusByName = manifest
-		? getCatalogAgentStatusByName(manifest)
-		: null;
-
-	for (const [name, agent] of Object.entries(AGENT_DEFINITIONS)) {
-		const status = agentStatusByName?.get(name);
-		if (agentStatusByName && !isNativeAgentInstallableStatus(status)) continue;
-
-		const dst = join(agentsDir, `${name}.toml`);
-		const promptPath = join(pkgRoot, "prompts", `${name}.md`);
-		if (!existsSync(dst) || !existsSync(promptPath)) continue;
-
-		const promptContent = await readFile(promptPath, "utf-8");
-		const expectedToml = generateAgentToml(agent, promptContent, {
-			codexHomeOverride: join(agentsDir, ".."),
-		});
-		const installedToml = await readFile(dst, "utf-8");
-		if (
-			installedToml !== expectedToml &&
-			!isGeneratedOmxNativeAgentToml(installedToml, name)
-		) {
-			summary.skipped += 1;
-			if (options.verbose) {
-				console.log(
-					`  skipped legacy native agent cleanup for ${name}.toml: installed content is not an OMX-generated native agent`,
-				);
-			}
-			continue;
-		}
-
-		if (await ensureBackup(dst, true, backupContext, options)) {
-			summary.backedUp += 1;
-		}
-		if (!options.dryRun) {
-			await rm(dst, { force: true });
-		}
-		summary.removed += 1;
-		if (options.verbose) {
-			console.log(
-				`  ${options.dryRun ? "would archive and remove" : "archived and removed"} legacy native agent ${name}.toml`,
-			);
-		}
-	}
-
-	if (manifest) {
-		const generatedCleanup = await cleanupGeneratedNonInstallableNativeAgents(
-			agentsDir,
-			manifest,
-			backupContext,
-			options,
-		);
-		summary.backedUp += generatedCleanup.backedUp;
-		summary.removed += generatedCleanup.removed;
-	}
-
-	await removeEmptyDirectoryIfPresent(agentsDir, options);
-	return summary;
-}
-
 function stripPluginModeLegacyRootDefaults(config: string): string {
 	const lines = config.split(/\r?\n/);
 	const firstTableIndex = lines.findIndex((line) => /^\s*\[/.test(line));
@@ -1357,6 +1392,8 @@ function insertRootTomlKey(config: string, line: string): string {
 async function ensurePluginMarketplaceRegistration(
 	configPath: string,
 	pkgRoot: string,
+	mcpMode: SetupMcpMode,
+	removeFirstPartyMcp: boolean,
 	backupContext: SetupBackupContext,
 	summary: SetupCategorySummary,
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
@@ -1371,7 +1408,11 @@ async function ensurePluginMarketplaceRegistration(
 		? await readFile(configPath, "utf-8")
 		: "";
 	const nextConfig = upsertLocalOmxMarketplaceRegistration(
-		existingConfig,
+		upsertLocalOmxPluginMcpServerEnablement(
+			upsertLocalOmxPluginEnablement(existingConfig),
+			mcpMode === "compat",
+			{ removeWhenDisabled: removeFirstPartyMcp },
+		),
 		pkgRoot,
 	);
 	const destinationExists = existsSync(configPath);
@@ -1399,22 +1440,75 @@ async function ensurePluginMarketplaceRegistration(
 	return "updated";
 }
 
-async function applyPluginModeHooksConfig(
-	configPath: string,
+async function cleanupPluginModeManagedHooksJson(
+	existingHooksContent: string | null,
 	hooksPath: string,
-	pkgRoot: string,
 	backupContext: SetupBackupContext,
 	summary: SetupCategorySummary,
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 ): Promise<void> {
+	if (existingHooksContent === null) {
+		summary.unchanged += 1;
+		return;
+	}
+
+	const removed = removeManagedCodexHooks(existingHooksContent);
+	if (removed.removedCount === 0) {
+		summary.unchanged += 1;
+		return;
+	}
+
+	if (await ensureBackup(hooksPath, true, backupContext, options)) {
+		summary.backedUp += 1;
+	}
+	if (!options.dryRun) {
+		if (removed.nextContent === null) {
+			await rm(hooksPath, { force: true });
+		} else {
+			await writeFile(hooksPath, removed.nextContent);
+		}
+	}
+	summary.removed += removed.removedCount;
+	if (options.verbose) {
+		console.log(
+			`  ${options.dryRun ? "would remove" : "removed"} ${removed.removedCount} legacy setup-managed hook wrapper(s) from ${hooksPath}`,
+		);
+	}
+}
+
+async function applyPluginModeHooksConfig(
+	configPath: string,
+	hooksPath: string,
+	pkgRoot: string,
+	codexHomeDir: string,
+	backupContext: SetupBackupContext,
+	summary: SetupCategorySummary,
+	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
+		codexHookFeatureFlag: CodexHookFeatureFlag;
+		pluginScopedHooks: boolean;
+	},
+): Promise<void> {
 	const existingConfig = existsSync(configPath)
 		? await readFile(configPath, "utf-8")
 		: "";
-	const nextConfig = upsertManagedCodexHookTrustState(
-		upsertPluginModeRuntimeFeatureFlags(stripManagedCodexHookTrustState(existingConfig)),
-		pkgRoot,
+	const managedTrustState = buildManagedCodexHookTrustState(
 		hooksPath,
+		pkgRoot,
+		{ platform: process.platform, codexHomeDir },
 	);
+	const nextConfigBase = upsertPluginModeRuntimeFeatureFlags(
+		stripManagedCodexHookTrustState(existingConfig, { managedTrustState }),
+		options.codexHookFeatureFlag,
+		{ pluginScopedHooks: options.pluginScopedHooks },
+	);
+	const nextConfig = options.pluginScopedHooks
+		? nextConfigBase
+		: upsertManagedCodexHookTrustState(
+			nextConfigBase,
+			pkgRoot,
+			hooksPath,
+			{ platform: process.platform, codexHomeDir },
+		);
 	if (nextConfig !== existingConfig) {
 		if (
 			await ensureBackup(
@@ -1438,25 +1532,46 @@ async function applyPluginModeHooksConfig(
 	const existingHooksContent = existsSync(hooksPath)
 		? await readFile(hooksPath, "utf-8")
 		: null;
-	const hooksConfig = mergeManagedCodexHooksConfig(
-		existingHooksContent,
-		pkgRoot,
-		hooksPath,
-	);
-	await syncManagedContent(
-		hooksConfig,
-		hooksPath,
-		summary,
-		backupContext,
-		options,
-		`native hooks ${hooksPath}`,
-	);
+	if (options.pluginScopedHooks) {
+		await cleanupPluginModeManagedHooksJson(
+			existingHooksContent,
+			hooksPath,
+			backupContext,
+			summary,
+			options,
+		);
+	} else {
+		const hooksConfig = mergeManagedCodexHooksConfig(
+			existingHooksContent,
+			pkgRoot,
+			hooksPath,
+			{ platform: process.platform, codexHomeDir },
+		);
+		await syncManagedContent(
+			hooksConfig,
+			hooksPath,
+			summary,
+			backupContext,
+			options,
+			`native hooks ${hooksPath}`,
+		);
+		await syncManagedWindowsNativeHookShim(
+			codexHomeDir,
+			pkgRoot,
+			summary,
+			backupContext,
+			options,
+		);
+	}
 
-		if (options.verbose) {
-			console.log(
-				`  ${options.dryRun ? "would configure" : "configured"} plugin-mode native hooks and runtime feature flags at ${hooksPath}`,
-			);
-		}
+	if (options.verbose) {
+		const surface = options.pluginScopedHooks
+			? "official plugin-scoped hooks"
+			: `legacy native hooks at ${hooksPath}`;
+		console.log(
+			`  ${options.dryRun ? "would configure" : "configured"} plugin-mode ${surface} and runtime feature flags`,
+		);
+	}
 }
 
 async function applyPluginDeveloperInstructionsDefault(
@@ -1516,12 +1631,18 @@ async function applyPluginDeveloperInstructionsDefault(
 async function cleanupPluginModeLegacyConfig(
 	configPath: string,
 	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
+	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
+		preserveFirstPartyMcp?: boolean;
+	},
 ): Promise<boolean> {
 	if (!existsSync(configPath)) return false;
 
 	const original = await readFile(configPath, "utf-8");
+	const preservedFirstPartyMcp = options.preserveFirstPartyMcp
+		? extractFirstPartyOmxMcpSections(original)
+		: "";
 	let config = original;
+	config = stripFirstPartyOmxMcpSections(config);
 	config = stripExistingOmxBlocks(config).cleaned;
 	config = stripExistingSharedMcpRegistryBlock(config).cleaned;
 	config = stripPluginModeLegacyRootDefaults(config);
@@ -1529,6 +1650,9 @@ async function cleanupPluginModeLegacyConfig(
 	config = stripOmxFeatureFlags(config);
 	config = stripManagedCodexHookTrustState(config);
 	config = stripOmxEnvSettings(config);
+	if (preservedFirstPartyMcp) {
+		config = `${config.trimEnd()}\n\n${preservedFirstPartyMcp}\n`;
+	}
 	config = config.trim();
 	const nextConfig = config.length > 0 ? `${config}\n` : "";
 
@@ -1558,6 +1682,15 @@ async function cleanupPluginModeLegacyAgentsMd(
 	options: Pick<SetupOptions, "dryRun" | "verbose">,
 ): Promise<boolean> {
 	if (!existsSync(agentsMdPath)) return false;
+	const fileInfo = await lstat(agentsMdPath);
+	if (fileInfo.isSymbolicLink()) {
+		if (options.verbose) {
+			console.log(
+				`  preserved symlinked AGENTS.md at ${agentsMdPath}; plugin mode only removes direct legacy OMX-generated files`,
+			);
+		}
+		return false;
+	}
 
 	const content = await readFile(agentsMdPath, "utf-8");
 	if (!isOmxGeneratedAgentsMd(content)) return false;
@@ -1581,6 +1714,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		force = false,
 		dryRun = false,
 		installMode: requestedInstallMode,
+		mcpMode: requestedMcpMode,
 		scope: requestedScope,
 		verbose = false,
 		setupScopePrompt,
@@ -1590,6 +1724,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		pluginAgentsMdPrompt,
 		pluginDeveloperInstructionsPrompt,
 		pluginDeveloperInstructionsOverwritePrompt,
+		firstPartyMcpRemovalPrompt,
 	} = options;
 	const pkgRoot = getPackageRoot();
 	const projectRoot = process.cwd();
@@ -1607,9 +1742,14 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		Boolean(persistedPreferences?.installMode) &&
 		(!persistedPreferences?.scope ||
 			persistedPreferences.scope === effectiveScopeForInstallMode);
+	const wouldUsePersistedMcpMode =
+		!requestedMcpMode &&
+		Boolean(persistedPreferences?.mcpMode) &&
+		(!persistedPreferences?.scope ||
+			persistedPreferences.scope === effectiveScopeForInstallMode);
 	const shouldReviewPersistedSetup =
 		hasPersistedSetupPreferences(persistedPreferences) &&
-		(wouldUsePersistedScope || wouldUsePersistedInstallMode) &&
+		(wouldUsePersistedScope || wouldUsePersistedInstallMode || wouldUsePersistedMcpMode) &&
 		(typeof persistedSetupReviewPrompt === "function" ||
 			(process.stdin.isTTY && process.stdout.isTTY));
 	if (shouldReviewPersistedSetup) {
@@ -1635,7 +1775,44 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		persistedReviewDecision,
 		persistedPreferences,
 	);
+	const resolvedMcpMode = resolveSetupMcpMode(
+		resolvedScope.scope,
+		requestedMcpMode,
+		persistedReviewDecision,
+		persistedPreferences,
+	);
 	const scopeDirs = resolveScopeDirectories(resolvedScope.scope, projectRoot);
+	const existingConfigForMcpMigration = existsSync(scopeDirs.codexConfigFile)
+		? await readFile(scopeDirs.codexConfigFile, "utf-8")
+		: "";
+	const firstPartyMcpRegistrationKinds = [
+		hasFirstPartyOmxMcpRegistrations(existingConfigForMcpMigration)
+			? "config.toml [mcp_servers.omx_*]"
+			: null,
+		hasLocalOmxPluginMcpServerRegistrations(existingConfigForMcpMigration)
+			? "plugin mcp_servers overrides"
+			: null,
+	].filter((kind): kind is string => typeof kind === "string");
+	let removeFirstPartyMcpRegistrations = false;
+	const shouldOfferFirstPartyMcpRemoval =
+		resolvedMcpMode.mcpMode !== "compat" &&
+		firstPartyMcpRegistrationKinds.length > 0;
+	if (shouldOfferFirstPartyMcpRemoval) {
+		const canPrompt =
+			typeof firstPartyMcpRemovalPrompt === "function" ||
+			(process.stdin.isTTY && process.stdout.isTTY);
+		if (canPrompt) {
+			removeFirstPartyMcpRegistrations = firstPartyMcpRemovalPrompt
+				? await firstPartyMcpRemovalPrompt(
+						scopeDirs.codexConfigFile,
+						firstPartyMcpRegistrationKinds,
+					)
+				: await promptForFirstPartyMcpRemoval(
+						scopeDirs.codexConfigFile,
+						firstPartyMcpRegistrationKinds,
+					);
+		}
+	}
 	const scopeSourceMessage =
 		resolvedScope.source === "persisted" ? " (from .omx/setup-scope.json)" : "";
 	const backupContext = getBackupContext(resolvedScope.scope, projectRoot);
@@ -1671,12 +1848,31 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			`Using setup install mode: ${resolvedInstallMode.installMode}${installModeSourceMessage}\n`,
 		);
 	}
+	const mcpModeSourceMessage =
+		resolvedMcpMode.source === "persisted"
+			? " (from .omx/setup-scope.json)"
+			: "";
+	console.log(
+		`Using setup MCP mode: ${resolvedMcpMode.mcpMode}${mcpModeSourceMessage}\n`,
+	);
+	if (shouldOfferFirstPartyMcpRemoval) {
+		if (removeFirstPartyMcpRegistrations) {
+			console.log(
+				"Deprecated first-party OMX MCP registrations will be removed from config.toml during this setup run.\n",
+			);
+		} else {
+			console.log(
+				"warning: deprecated first-party OMX MCP registrations were detected but preserved. OMX supports CLI-first setup by default; rerun interactively and answer yes to remove them, or use --mcp compat only when explicit MCP compatibility is required.\n",
+			);
+		}
+	}
 
 	// Step 1: Ensure directories exist
 	console.log("[1/8] Creating directories...");
 	const dirs = isPluginInstallMode
 		? [
 				scopeDirs.codexHomeDir,
+				scopeDirs.nativeAgentsDir,
 				omxStateDir(projectRoot),
 				omxPlansDir(projectRoot),
 				omxLogsDir(projectRoot),
@@ -1696,17 +1892,15 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		}
 		if (verbose) console.log(`  mkdir ${dir}`);
 	}
-	const setupPreferencesToPersist: PersistedSetupScope =
-		resolvedInstallMode &&
+	const setupPreferencesToPersist: PersistedSetupScope = {
+		scope: resolvedScope.scope,
+		mcpMode: resolvedMcpMode.mcpMode,
+		...(resolvedInstallMode &&
 		(resolvedScope.scope === "user" ||
 			resolvedInstallMode.installMode === "plugin")
-			? {
-					scope: resolvedScope.scope,
-					installMode: resolvedInstallMode.installMode,
-				}
-			: {
-					scope: resolvedScope.scope,
-				};
+			? { installMode: resolvedInstallMode.installMode }
+			: {}),
+	};
 	await persistSetupPreferences(projectRoot, setupPreferencesToPersist, {
 		dryRun,
 		verbose,
@@ -1839,16 +2033,19 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	// Step 4: Install native agent configs
 	console.log("[4/8] Installing native agent configs...");
 	if (isPluginInstallMode) {
-		summary.nativeAgents = await cleanupPluginModeLegacyNativeAgents(
+		summary.nativeAgents = await refreshNativeAgentConfigs(
 			pkgRoot,
 			scopeDirs.nativeAgentsDir,
 			backupContext,
-			{ dryRun, verbose },
+			{
+				force,
+				dryRun,
+				verbose,
+				preserveUnmanagedObsoleteNativeAgents: true,
+			},
 		);
 		console.log(
-			summary.nativeAgents.removed > 0
-				? `  ${dryRun ? "Would archive and remove" : "Archived and removed"} ${summary.nativeAgents.removed} legacy OMX-managed native agent config(s).\n`
-				: "  Native agent refresh skipped; no legacy OMX-managed native agent configs found.\n",
+			`  Native agent role refresh complete (${scopeDirs.nativeAgentsDir}); plugin mode still installs role TOML so agent_type routing works.\n`,
 		);
 	} else {
 		summary.nativeAgents = await refreshNativeAgentConfigs(
@@ -1870,11 +2067,59 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	console.log("[5/8] Updating config.toml...");
 	let resolvedConfig = "";
 	let omxManagesTui = false;
+	const codexHookFeatureSupport = resolveCodexHookFeatureSupportForCli({
+		codexFeaturesProbe: options.codexFeaturesProbe,
+		codexVersionProbe: options.codexVersionProbe,
+	});
+	const codexHookFeatureFlag = codexHookFeatureSupport.hookFeatureFlag;
+	const pluginScopedHooksSupported = codexHookFeatureSupport.pluginScopedHooks;
+	if (verbose) {
+		console.log(
+			`  Native Codex hook feature flag: [features].${codexHookFeatureFlag}`,
+		);
+		console.log(
+			`  Plugin-scoped Codex hooks: ${pluginScopedHooksSupported ? "supported" : "not reported; using legacy setup fallback"}`,
+		);
+	}
+	const shouldSyncSharedMcpRegistry = resolvedMcpMode.mcpMode === "compat";
+	const registryCandidates = getUnifiedMcpRegistryCandidates();
+	const defaultRegistryCandidates = registryCandidates.slice(0, 1);
+	const sharedMcpRegistry: UnifiedMcpRegistryLoadResult = shouldSyncSharedMcpRegistry
+		? await loadUnifiedMcpRegistry({
+				candidates: options.mcpRegistryCandidates ?? defaultRegistryCandidates,
+			})
+		: { servers: [], warnings: [] };
+	const legacyRegistryCandidate = getLegacyUnifiedMcpRegistryCandidate();
+	if (
+		shouldSyncSharedMcpRegistry &&
+		!options.mcpRegistryCandidates &&
+		!sharedMcpRegistry.sourcePath &&
+		existsSync(legacyRegistryCandidate) &&
+		!existsSync(defaultRegistryCandidates[0])
+	) {
+		console.log(
+			`  warning: legacy shared MCP registry detected at ${legacyRegistryCandidate} but ignored by default; move or copy it to ${defaultRegistryCandidates[0]} and rerun setup with --mcp compat if you still want setup to sync those servers`,
+		);
+	}
+	if (verbose && sharedMcpRegistry.sourcePath) {
+		console.log(
+			`  shared MCP registry: ${sharedMcpRegistry.sourcePath} (${sharedMcpRegistry.servers.length} servers)`,
+		);
+	}
+	for (const warning of sharedMcpRegistry.warnings) {
+		console.log(`  warning: ${warning}`);
+	}
 	if (isPluginInstallMode) {
 		const configCleaned = await cleanupPluginModeLegacyConfig(
 			scopeDirs.codexConfigFile,
 			backupContext,
-			{ dryRun, verbose },
+			{
+				dryRun,
+				verbose,
+				preserveFirstPartyMcp:
+					shouldOfferFirstPartyMcpRemoval &&
+					!removeFirstPartyMcpRegistrations,
+			},
 		);
 		if (configCleaned) summary.config.removed += 1;
 		console.log(
@@ -1887,13 +2132,21 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			scopeDirs.codexConfigFile,
 			scopeDirs.codexHooksFile,
 			pkgRoot,
+			scopeDirs.codexHomeDir,
 			backupContext,
 			summary.config,
-			{ dryRun, verbose },
+			{
+				dryRun,
+				verbose,
+				codexHookFeatureFlag,
+				pluginScopedHooks: pluginScopedHooksSupported,
+			},
 		);
 		const pluginMarketplaceResult = await ensurePluginMarketplaceRegistration(
 			scopeDirs.codexConfigFile,
 			pkgRoot,
+			resolvedMcpMode.mcpMode,
+			removeFirstPartyMcpRegistrations,
 			backupContext,
 			summary.config,
 			{ dryRun, verbose },
@@ -1911,10 +2164,15 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				`  Local Codex plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} already registered (${pkgRoot}).`,
 			);
 		}
-		const pluginCacheRefresh = await refreshOmxPluginDiscoveryCache(pkgRoot, {
-			dryRun,
-			verbose,
-		});
+		const packagedMarketplace = await resolvePackagedOmxMarketplace(pkgRoot);
+		const pluginCacheRefresh = await refreshOmxPluginDiscoveryCache(
+			pkgRoot,
+			{
+				dryRun,
+				verbose,
+			},
+			scopeDirs.codexHomeDir,
+		);
 		if (pluginCacheRefresh.status === "refreshed") {
 			console.log(
 				`  ${dryRun ? "Would invalidate" : "Invalidated"} ${pluginCacheRefresh.staleDirs.length} stale Codex plugin discovery cache entr${pluginCacheRefresh.staleDirs.length === 1 ? "y" : "ies"} so plugin skills refresh from the packaged manifest.`,
@@ -1922,12 +2180,43 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		} else if (pluginCacheRefresh.status === "unchanged") {
 			console.log("  Codex plugin discovery cache already matches packaged plugin metadata.");
 		}
-			resolvedConfig = existsSync(scopeDirs.codexConfigFile)
-				? await readFile(scopeDirs.codexConfigFile, "utf-8")
-				: "";
+		const pluginCacheMaterialize = await materializePackagedOmxPluginCache(
+			scopeDirs.codexHomeDir,
+			packagedMarketplace,
+			{ dryRun },
+		);
+		if (pluginCacheMaterialize.status === "materialized") {
 			console.log(
-				`  Native Codex hooks and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; codex_hooks, goals).\n`,
+				`  ${dryRun ? "Would install" : "Installed"} local Codex plugin cache for ${OMX_LOCAL_MARKETPLACE_NAME}/${OMX_PLUGIN_NAME} at ${pluginCacheMaterialize.cacheDir}.`,
 			);
+		} else if (pluginCacheMaterialize.status === "unchanged") {
+			console.log("  Local Codex plugin cache already exposes packaged OMX skills.");
+		}
+		if (shouldSyncSharedMcpRegistry) {
+			resolvedConfig = await syncSharedMcpRegistryIntoConfig(
+				scopeDirs.codexConfigFile,
+				sharedMcpRegistry,
+				summary.config,
+				backupContext,
+				{ dryRun, verbose },
+			);
+			if (resolvedScope.scope === "user") {
+				await syncClaudeCodeMcpSettings(
+					sharedMcpRegistry,
+					summary.config,
+					backupContext,
+					{ dryRun, verbose },
+				);
+			}
+		}
+		resolvedConfig = existsSync(scopeDirs.codexConfigFile)
+			? await readFile(scopeDirs.codexConfigFile, "utf-8")
+			: "";
+		console.log(
+			pluginScopedHooksSupported
+				? "  Plugin-scoped Codex hooks and runtime feature flags refresh complete (plugin_hooks, goals).\n"
+				: `  Native Codex hooks fallback and runtime feature flags refresh complete (${scopeDirs.codexHooksFile}; hooks, goals).\n`,
+		);
 
 		if (usePluginDeveloperInstructionsDefault) {
 			const developerInstructionsResult =
@@ -1959,30 +2248,6 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			);
 		}
 	} else {
-		const registryCandidates = getUnifiedMcpRegistryCandidates();
-		const defaultRegistryCandidates = registryCandidates.slice(0, 1);
-		const legacyRegistryCandidate = getLegacyUnifiedMcpRegistryCandidate();
-		const sharedMcpRegistry = await loadUnifiedMcpRegistry({
-			candidates: options.mcpRegistryCandidates ?? defaultRegistryCandidates,
-		});
-		if (
-			!options.mcpRegistryCandidates &&
-			!sharedMcpRegistry.sourcePath &&
-			existsSync(legacyRegistryCandidate) &&
-			!existsSync(defaultRegistryCandidates[0])
-		) {
-			console.log(
-				`  warning: legacy shared MCP registry detected at ${legacyRegistryCandidate} but ignored by default; move it to ${defaultRegistryCandidates[0]} if you still want setup to sync those servers`,
-			);
-		}
-		if (verbose && sharedMcpRegistry.sourcePath) {
-			console.log(
-				`  shared MCP registry: ${sharedMcpRegistry.sourcePath} (${sharedMcpRegistry.servers.length} servers)`,
-			);
-		}
-		for (const warning of sharedMcpRegistry.warnings) {
-			console.log(`  warning: ${warning}`);
-		}
 		const statusLinePreset = await resolveStatusLinePresetForSetup(
 			projectRoot,
 			{ force },
@@ -1992,6 +2257,10 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			scopeDirs.codexHooksFile,
 			pkgRoot,
 			sharedMcpRegistry,
+			resolvedMcpMode.mcpMode,
+			shouldOfferFirstPartyMcpRemoval && !removeFirstPartyMcpRegistrations,
+			resolvedScope.scope,
+			scopeDirs.codexHomeDir,
 			summary.config,
 			backupContext,
 			{
@@ -2000,6 +2269,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				verbose,
 				statusLinePreset,
 				forceStatusLinePreset: force,
+				codexHookFeatureFlag,
 			},
 		);
 		resolvedConfig = managedConfig.finalConfig;
@@ -2009,7 +2279,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				"  Removed retired [mcp_servers.omx_team_run] config during refresh.",
 			);
 		}
-		if (resolvedScope.scope === "user") {
+		if (shouldSyncSharedMcpRegistry && resolvedScope.scope === "user") {
 			await syncClaudeCodeMcpSettings(
 				sharedMcpRegistry,
 				summary.config,
@@ -2025,6 +2295,8 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		const hooksConfig = mergeManagedCodexHooksConfig(
 			existingHooksContent,
 			pkgRoot,
+			scopeDirs.codexHooksFile,
+			{ platform: process.platform, codexHomeDir: scopeDirs.codexHomeDir },
 		);
 		await syncManagedContent(
 			hooksConfig,
@@ -2033,6 +2305,13 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			backupContext,
 			{ dryRun, verbose },
 			`native hooks ${scopeDirs.codexHooksFile}`,
+		);
+		await syncManagedWindowsNativeHookShim(
+			scopeDirs.codexHomeDir,
+			pkgRoot,
+			summary.config,
+			backupContext,
+			{ dryRun, verbose },
 		);
 		console.log(
 			`  Native Codex hooks refresh complete (${scopeDirs.codexHooksFile}).\n`,
@@ -2159,6 +2438,16 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			if (agentsMdExists) {
 				const existing = await readFile(agentsMdDst, "utf-8");
 				changed = existing !== rewritten;
+				if (!hasOmxAgentsContract(existing)) {
+					const scopeFlag =
+						resolvedScope.scope === "project" ? "--scope project" : "--scope user";
+					console.log(
+						`  WARNING: Existing AGENTS.md at ${agentsMdDst} lacks OMX contract markers; it may have been overwritten by another tool.`,
+					);
+					console.log(
+						`  Repair safely with "omx setup ${scopeFlag} --merge-agents" to preserve local guidance, or "omx setup ${scopeFlag} --force" to replace it after backup.`,
+					);
+				}
 				if (options.mergeAgents) {
 					mergedAgentsContent = upsertManagedAgentsBlock(existing, rewritten);
 					canApplyManagedAgentsMerge = mergedAgentsContent !== existing;
@@ -2332,7 +2621,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			"  4. Optional AGENTS.md and developer_instructions defaults are only installed when selected during plugin-mode setup",
 		);
 		console.log(
-			"  5. Legacy native-agent TOML defaults remain uninstalled in plugin mode",
+			"  5. Native agent role TOML files written to .codex/agents/ for agent_type routing",
 		);
 	} else {
 		console.log(
@@ -2476,6 +2765,27 @@ async function syncManagedContent(
 			`  ${options.dryRun ? "would update" : "updated"} ${verboseLabel}`,
 		);
 	}
+}
+
+async function syncManagedWindowsNativeHookShim(
+	codexHomeDir: string,
+	pkgRoot: string,
+	summary: SetupCategorySummary,
+	backupContext: SetupBackupContext,
+	options: Pick<SetupOptions, "dryRun" | "verbose">,
+): Promise<void> {
+	if (process.platform !== "win32") return;
+
+	const shimPath = buildManagedCodexNativeHookWindowsShimPath(codexHomeDir);
+	const shimContent = buildManagedCodexNativeHookWindowsShimContent(pkgRoot);
+	await syncManagedContent(
+		shimContent,
+		shimPath,
+		summary,
+		backupContext,
+		options,
+		`native hook Windows shim ${shimPath}`,
+	);
 }
 
 async function syncManagedAgentsContent(
@@ -2700,7 +3010,9 @@ async function refreshNativeAgentConfigs(
 	pkgRoot: string,
 	agentsDir: string,
 	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose" | "force">,
+	options: Pick<SetupOptions, "dryRun" | "verbose" | "force"> & {
+		preserveUnmanagedObsoleteNativeAgents?: boolean;
+	},
 ): Promise<SetupCategorySummary> {
 	const summary = createEmptyCategorySummary();
 
@@ -2807,7 +3119,9 @@ async function refreshNativeAgentConfigs(
 async function cleanupObsoleteNativeAgents(
 	agentsDir: string,
 	backupContext: SetupBackupContext,
-	options: Pick<SetupOptions, "dryRun" | "verbose">,
+	options: Pick<SetupOptions, "dryRun" | "verbose"> & {
+		preserveUnmanagedObsoleteNativeAgents?: boolean;
+	},
 ): Promise<number> {
 	if (!existsSync(agentsDir)) return 0;
 
@@ -2826,6 +3140,19 @@ async function cleanupObsoleteNativeAgents(
 		}
 
 		if (!containsTomlKey(content, OBSOLETE_NATIVE_AGENT_FIELD)) continue;
+
+		const agentName = file.slice(0, -5);
+		if (
+			options.preserveUnmanagedObsoleteNativeAgents &&
+			!isGeneratedOmxNativeAgentToml(content, agentName)
+		) {
+			if (options.verbose) {
+				console.log(
+					`  skipped stale obsolete native agent ${file}: not an OMX-generated native agent`,
+				);
+			}
+			continue;
+		}
 
 		if (await ensureBackup(fullPath, true, backupContext, options)) {
 			// backup created for pre-existing obsolete native agent config
@@ -3061,16 +3388,110 @@ async function cleanupLegacyManagedSkills(
 	return result;
 }
 
+interface NotifyMergePlan {
+	notifyCommand: string[] | false;
+	metadataPath?: string;
+	metadata?: Record<string, unknown>;
+}
+
+function getNotifyMetadataPath(codexHomeDir: string): string {
+	return join(codexHomeDir, ".omx", "notify-dispatch.json");
+}
+
+async function buildNotifyMergePlan(
+	existingConfig: string,
+	pkgRoot: string,
+	codexHomeDir: string,
+	scope: SetupScope,
+): Promise<NotifyMergePlan> {
+	if (scope === "project") {
+		return { notifyCommand: false };
+	}
+
+	const omxNotify = ["node", join(pkgRoot, "dist", "scripts", "notify-hook.js")];
+	const metadataPath = getNotifyMetadataPath(codexHomeDir);
+	const dispatcherNotify = [
+		"node",
+		join(pkgRoot, "dist", "scripts", "notify-dispatcher.js"),
+		"--metadata",
+		metadataPath,
+	];
+	const existingNotify = getRootTomlArray(existingConfig, "notify");
+
+	if (!existingNotify) {
+		return { notifyCommand: omxNotify };
+	}
+
+	if (isOmxManagedNotifyCommand(existingNotify, pkgRoot)) {
+		if (
+			!existingNotify.some((part) =>
+				/(?:^|[\\/])notify-dispatcher\.js$/.test(part),
+			)
+		) {
+			return { notifyCommand: omxNotify };
+		}
+		try {
+			const metadata = JSON.parse(await readFile(metadataPath, "utf-8")) as {
+				previousNotify?: unknown;
+			};
+			const previousNotify = metadata.previousNotify;
+			if (
+				Array.isArray(previousNotify) &&
+				previousNotify.every((item) => typeof item === "string")
+			) {
+				const sanitizedPreviousNotify = sanitizePreviousNotifyCommand(
+					previousNotify,
+					pkgRoot,
+				);
+				if (!sanitizedPreviousNotify) {
+					return { notifyCommand: omxNotify };
+				}
+				return {
+					notifyCommand: dispatcherNotify,
+					metadataPath,
+					metadata: {
+						managedBy: "oh-my-codex",
+						version: 1,
+						previousNotify: sanitizedPreviousNotify,
+						omxNotify,
+						dispatcherNotify,
+					},
+				};
+			}
+		} catch {
+			// Missing dispatcher metadata: fall back to plain OMX notify instead of nesting.
+		}
+		return { notifyCommand: omxNotify };
+	}
+
+	return {
+		notifyCommand: dispatcherNotify,
+		metadataPath,
+		metadata: {
+			managedBy: "oh-my-codex",
+			version: 1,
+			previousNotify: sanitizePreviousNotifyCommand(existingNotify, pkgRoot),
+			omxNotify,
+			dispatcherNotify,
+		},
+	};
+}
+
 async function updateManagedConfig(
 	configPath: string,
 	hooksPath: string,
 	pkgRoot: string,
 	sharedMcpRegistry: UnifiedMcpRegistryLoadResult,
+	mcpMode: SetupMcpMode,
+	preserveExistingFirstPartyMcp: boolean,
+	scope: SetupScope,
+	codexHomeDir: string,
 	summary: SetupCategorySummary,
 	backupContext: SetupBackupContext,
 	options: Pick<SetupOptions, "dryRun" | "verbose" | "modelUpgradePrompt"> & {
 		statusLinePreset?: HudPreset;
 		forceStatusLinePreset?: boolean;
+		codexHookFeatureFlag: CodexHookFeatureFlag;
 	},
 ): Promise<ManagedConfigResult> {
 	const existing = existsSync(configPath)
@@ -3095,15 +3516,27 @@ async function updateManagedConfig(
 		}
 	}
 
+	const notifyPlan = await buildNotifyMergePlan(
+		existing,
+		pkgRoot,
+		codexHomeDir,
+		scope,
+	);
 	const finalConfig = buildMergedConfig(existing, pkgRoot, {
 		includeTui: omxManagesTui,
 		codexHooksFile: hooksPath,
+		codexHomeDir,
+		hookCommandPlatform: process.platform,
+		codexHookFeatureFlag: options.codexHookFeatureFlag,
 		modelOverride,
 		sharedMcpServers: sharedMcpRegistry.servers,
 		sharedMcpRegistrySource: sharedMcpRegistry.sourcePath,
 		verbose: options.verbose,
 		statusLinePreset: options.statusLinePreset,
 		forceStatusLinePreset: options.forceStatusLinePreset,
+		notifyCommand: notifyPlan.notifyCommand,
+		includeFirstPartyMcp: mcpMode === "compat",
+		preserveExistingFirstPartyMcp,
 	});
 	const changed = existing !== finalConfig;
 
@@ -3129,6 +3562,13 @@ async function updateManagedConfig(
 
 	if (!options.dryRun) {
 		await writeFile(configPath, finalConfig);
+		if (notifyPlan.metadataPath && notifyPlan.metadata) {
+			await mkdir(dirname(notifyPlan.metadataPath), { recursive: true });
+			await writeFile(
+				notifyPlan.metadataPath,
+				JSON.stringify(notifyPlan.metadata, null, 2) + "\n",
+			);
+		}
 	}
 
 	if (
@@ -3154,6 +3594,51 @@ async function updateManagedConfig(
 		repairedLegacyTeamRunTable:
 			hadLegacyTeamRunTable && !hasLegacyOmxTeamRunTable(finalConfig),
 	};
+}
+
+async function syncSharedMcpRegistryIntoConfig(
+	configPath: string,
+	sharedMcpRegistry: UnifiedMcpRegistryLoadResult,
+	summary: SetupCategorySummary,
+	backupContext: SetupBackupContext,
+	options: Pick<SetupOptions, "dryRun" | "verbose">,
+): Promise<string> {
+	if (sharedMcpRegistry.servers.length === 0) {
+		return existsSync(configPath) ? await readFile(configPath, "utf-8") : "";
+	}
+
+	const existing = existsSync(configPath)
+		? await readFile(configPath, "utf-8")
+		: "";
+	const finalConfig = mergeSharedMcpRegistryBlock(
+		existing,
+		sharedMcpRegistry.servers,
+		sharedMcpRegistry.sourcePath,
+	);
+	if (existing === finalConfig) {
+		summary.unchanged += 1;
+		return finalConfig;
+	}
+	if (
+		await ensureBackup(
+			configPath,
+			existsSync(configPath),
+			backupContext,
+			options,
+		)
+	) {
+		summary.backedUp += 1;
+	}
+	if (!options.dryRun) {
+		await writeFile(configPath, finalConfig);
+	}
+	summary.updated += 1;
+	if (options.verbose) {
+		console.log(
+			`  ${options.dryRun ? "would sync" : "synced"} shared MCP registry servers into ${configPath}`,
+		);
+	}
+	return finalConfig;
 }
 
 function getClaudeCodeSettingsPath(homeDir = homedir()): string {

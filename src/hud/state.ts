@@ -9,16 +9,16 @@ import { readFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { join, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
-import { omxStateDir } from '../utils/paths.js';
 import { findGitLayout, readGitLayoutFile } from '../utils/git-layout.js';
 import { getDefaultBridge, isBridgeEnabled } from '../runtime/bridge.js';
 import type { RuntimeSnapshot } from '../runtime/bridge.js';
-import { getReadScopedStateFilePaths, getReadScopedStatePaths, readCurrentSessionId } from '../mcp/state-paths.js';
+import { getBaseStateDir, getReadScopedStateFilePaths, getReadScopedStatePaths, readCurrentSessionId } from '../mcp/state-paths.js';
 import { teamReadPhase as readTeamPhase } from '../team/team-ops.js';
 import { readUsableSessionState } from '../hooks/session.js';
-import { listActiveSkills, readVisibleSkillActiveState } from '../state/skill-active.js';
+import { listActiveSkills, readVisibleSkillActiveStateForStateDir } from '../state/skill-active.js';
 import type {
   RalphStateForHud,
+  UltragoalStateForHud,
   UltraworkStateForHud,
   AutopilotStateForHud,
   RalplanStateForHud,
@@ -112,6 +112,107 @@ export function normalizeHudConfig(raw: HudConfig | null | undefined): ResolvedH
   }
 
   return normalized;
+}
+
+interface RawUltragoalGoal {
+  id?: unknown;
+  title?: unknown;
+  objective?: unknown;
+  status?: unknown;
+}
+
+interface RawUltragoalPlan {
+  activeGoalId?: unknown;
+  aggregateCompletion?: unknown;
+  goals?: unknown;
+}
+
+const ULTRAGOAL_ACTIVE_STATUSES = new Set(['in_progress', 'review_blocked', 'needs_user_decision']);
+const ULTRAGOAL_UNRESOLVED_STATUSES = new Set(['pending', 'in_progress', 'failed', 'review_blocked', 'needs_user_decision']);
+
+type NormalizedUltragoalGoal = {
+  id: string;
+  title: string;
+  objective: string;
+  status: string;
+};
+
+function normalizeUltragoalGoal(raw: unknown): NormalizedUltragoalGoal | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const goal = raw as RawUltragoalGoal;
+  const id = sanitizeOptionalString(goal.id);
+  const title = sanitizeOptionalString(goal.title);
+  const objective = sanitizeOptionalString(goal.objective);
+  const status = sanitizeOptionalString(goal.status);
+  if (!id || !title || !objective || !status) return null;
+  return { id, title, objective, status };
+}
+
+function isAggregateComplete(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  return (value as { status?: unknown }).status === 'complete';
+}
+
+export async function readUltragoalState(cwd: string): Promise<UltragoalStateForHud | null> {
+  const plan = await readJsonFile<RawUltragoalPlan>(join(cwd, '.omx', 'ultragoal', 'goals.json'));
+  if (!plan || typeof plan !== 'object' || !Array.isArray(plan.goals)) return null;
+
+  const goals = plan.goals.map(normalizeUltragoalGoal).filter((goal): goal is NormalizedUltragoalGoal => goal !== null);
+  if (goals.length === 0) return null;
+
+  const completed_goals = goals.filter((goal) => goal.status === 'complete').length;
+  const pending_goals = goals.filter((goal) => goal.status === 'pending').length;
+  const in_progress_goals = goals.filter((goal) => goal.status === 'in_progress').length;
+  const failed_goals = goals.filter((goal) => goal.status === 'failed').length;
+  const review_blocked_goals = goals.filter((goal) => goal.status === 'review_blocked').length;
+  const needs_user_decision_goals = goals.filter((goal) => goal.status === 'needs_user_decision').length;
+  const unresolved_goals = goals.length - completed_goals;
+  const activeGoalId = sanitizeOptionalString(plan.activeGoalId);
+  const activeGoal = (
+    (activeGoalId ? goals.find((goal) => goal.id === activeGoalId && goal.status !== 'complete') : undefined)
+    ?? goals.find((goal) => ULTRAGOAL_ACTIVE_STATUSES.has(goal.status))
+    ?? goals.find((goal) => ULTRAGOAL_UNRESOLVED_STATUSES.has(goal.status))
+  );
+  const activeIndex = activeGoal ? goals.findIndex((goal) => goal.id === activeGoal.id) : -1;
+  const complete = isAggregateComplete(plan.aggregateCompletion) || unresolved_goals === 0;
+  const toHudGoal = ({ goal, index }: { goal: NormalizedUltragoalGoal; index: number }) => ({
+    id: goal.id,
+    title: goal.title,
+    objective: goal.objective,
+    status: goal.status,
+    index: index + 1,
+  });
+  const nextPendingGoals = goals
+    .map((goal, index) => ({ goal, index }))
+    .filter(({ goal, index }) => index > activeIndex && goal.status === 'pending' && goal.id !== activeGoal?.id)
+    .slice(0, 3)
+    .map(toHudGoal);
+  const orderedOngoingGoals = [
+    ...(activeGoal && activeIndex >= 0 ? [toHudGoal({ goal: activeGoal, index: activeIndex })] : []),
+    ...nextPendingGoals,
+  ];
+
+  return {
+    active: !complete,
+    status: complete ? 'complete' : activeGoal?.status ?? 'active',
+    total: goals.length,
+    complete: completed_goals,
+    pending: pending_goals,
+    inProgress: in_progress_goals,
+    failed: failed_goals,
+    reviewBlocked: review_blocked_goals,
+    needsUserDecision: needs_user_decision_goals,
+    progressTotal: goals.length,
+    activeGoal: activeGoal && activeIndex >= 0 ? {
+      id: activeGoal.id,
+      title: activeGoal.title,
+      objective: activeGoal.objective,
+      status: activeGoal.status,
+      index: activeIndex + 1,
+    } : undefined,
+    ongoingGoals: orderedOngoingGoals,
+    nextGoals: nextPendingGoals,
+  };
 }
 
 export async function readRalphState(cwd: string): Promise<RalphStateForHud | null> {
@@ -409,7 +510,8 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     readSessionState(cwd),
     readCurrentSessionId(cwd),
   ]);
-  const canonicalSkillState = await readVisibleSkillActiveState(cwd, currentSessionId);
+  const stateDir = getBaseStateDir(cwd);
+  const canonicalSkillState = await readVisibleSkillActiveStateForStateDir(stateDir, currentSessionId);
   const canonicalSkills = new Map(
     listActiveSkills(canonicalSkillState).map((entry) => [entry.skill, entry] as const),
   );
@@ -417,6 +519,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
 
   const [
     ralphDetail,
+    ultragoal,
     ultraworkDetail,
     autopilotDetail,
     ralplanDetail,
@@ -426,6 +529,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     teamDetail,
   ] = await Promise.all([
     readSessionAwareModeState<RalphStateForHud>(cwd, 'ralph'),
+    readUltragoalState(cwd),
     readSessionAwareModeState<UltraworkStateForHud>(cwd, 'ultrawork'),
     readSessionAwareModeState<AutopilotStateForHud>(cwd, 'autopilot'),
     readSessionAwareModeState<RalplanStateForHud>(cwd, 'ralplan'),
@@ -481,7 +585,6 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
   // for authority/backlog/readiness display over JS-inferred state.
   let runtimeSnapshot: RuntimeSnapshot | null = null;
   if (isBridgeEnabled()) {
-    const stateDir = omxStateDir(cwd);
     const bridge = getDefaultBridge(stateDir);
     runtimeSnapshot = bridge.readCompatFile<RuntimeSnapshot>('snapshot.json');
   }
@@ -490,6 +593,7 @@ export async function readAllState(cwd: string, config: ResolvedHudConfig = DEFA
     version,
     gitBranch,
     ralph,
+    ultragoal,
     ultrawork,
     autopilot,
     ralplan,

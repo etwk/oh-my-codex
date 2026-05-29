@@ -28,13 +28,21 @@ import { hasReadableWiki, queryWiki } from '../wiki/index.js';
 import { resolveCodexHomeForLaunch } from './codex-home.js';
 import { runProcessTreeWithTimeout } from '../runtime/process-tree.js';
 
+export const EXPLORE_DEPRECATION_NOTICE = 'DEPRECATED: `omx explore` is deprecated. Use the normal Codex repository tools/subagents for repo inspection, or `omx sparkshell` for explicit shell-native read-only commands.';
+
 export const EXPLORE_USAGE = [
+  EXPLORE_DEPRECATION_NOTICE,
   'Usage: omx explore --prompt "<prompt>"',
   '   or: omx explore --prompt-file <file>',
+  '',
+  'Compatibility only: existing callers may still use --prompt/--prompt-file temporarily.',
+  'Never use positional prompt text. Use: omx explore --prompt "find package.json"',
 ].join('\n');
 
 const PROMPT_FLAG = '--prompt';
 const PROMPT_FILE_FLAG = '--prompt-file';
+const VERBOSE_FLAG = '--verbose';
+const JSON_FLAG = '--json';
 export const EXPLORE_BIN_ENV = EXPLORE_BIN_ENV_SHARED;
 const EXPLORE_SPARK_MODEL_ENV = 'OMX_EXPLORE_SPARK_MODEL';
 const EXPLORE_INSTRUCTIONS_FILE_ENV = 'OMX_EXPLORE_MODEL_INSTRUCTIONS_FILE';
@@ -55,11 +63,43 @@ const WINDOWS_BUILTIN_EXPLORE_HARNESS_REASON =
 export interface ParsedExploreArgs {
   prompt?: string;
   promptFile?: string;
+  verbose?: boolean;
+  json?: boolean;
 }
 
 interface ExploreHarnessCommand {
   command: string;
   args: string[];
+}
+
+interface ExploreTelemetryEvent {
+  backend: 'local-fast-path' | 'sparkshell' | 'explore-harness';
+  reason: string;
+  fallbackReason?: string;
+  elapsedMs?: number;
+}
+
+function telemetryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.OMX_EXPLORE_VERBOSE === '1' || env.OMX_EXPLORE_JSON === '1';
+}
+
+function emitExploreTelemetry(event: ExploreTelemetryEvent, env: NodeJS.ProcessEnv = process.env): void {
+  if (!telemetryEnabled(env)) return;
+  const payload = {
+    backend: event.backend,
+    reason: event.reason,
+    fallback_reason: event.fallbackReason ?? null,
+    elapsed_ms: event.elapsedMs ?? null,
+  };
+  if (env.OMX_EXPLORE_JSON === '1') {
+    process.stderr.write(`[omx explore telemetry] ${JSON.stringify(payload)}\n`);
+    return;
+  }
+  process.stderr.write(
+    `[omx explore] backend=${payload.backend} reason=${payload.reason}`
+      + `${payload.fallback_reason ? ` fallback=${payload.fallback_reason}` : ''}`
+      + `${payload.elapsed_ms !== null ? ` elapsed_ms=${payload.elapsed_ms}` : ''}\n`,
+  );
 }
 
 
@@ -449,6 +489,10 @@ function exploreUsageError(reason: string): Error {
   return new Error(`${reason}\n${EXPLORE_USAGE}`);
 }
 
+function isHelpArg(token: string): boolean {
+  return token === '--help' || token === '-h';
+}
+
 function appendPromptValue(current: string | undefined, value: string, reason: string): string {
   const trimmed = value.trim();
   if (!trimmed) throw exploreUsageError(reason);
@@ -470,9 +514,19 @@ function hasPromptSource(tokens: readonly string[], flag: string): boolean {
 export function parseExploreArgs(args: readonly string[]): ParsedExploreArgs {
   let prompt: string | undefined;
   let promptFile: string | undefined;
+  let verbose = false;
+  let json = false;
 
   for (let i = 0; i < args.length; i += 1) {
     const token = args[i];
+    if (token === VERBOSE_FLAG) {
+      verbose = true;
+      continue;
+    }
+    if (token === JSON_FLAG) {
+      json = true;
+      continue;
+    }
     if (token === PROMPT_FLAG) {
       const remaining = args.slice(i + 1);
       if (remaining.length === 0 || remaining[0].startsWith('-')) {
@@ -503,6 +557,9 @@ export function parseExploreArgs(args: readonly string[]): ParsedExploreArgs {
       promptFile = appendPromptFileValue(promptFile, token.slice(`${PROMPT_FILE_FLAG}=`.length), 'Missing path after --prompt-file=.');
       continue;
     }
+    if (!token.startsWith('-')) {
+      throw exploreUsageError(`Positional prompt text is not supported. Use: omx explore --prompt "${args.slice(i).join(' ')}"`);
+    }
     throw exploreUsageError(`Unknown argument: ${token}`);
   }
 
@@ -516,6 +573,8 @@ export function parseExploreArgs(args: readonly string[]): ParsedExploreArgs {
   return {
     ...(prompt ? { prompt } : {}),
     ...(promptFile ? { promptFile } : {}),
+    ...(verbose ? { verbose } : {}),
+    ...(json ? { json } : {}),
   };
 }
 
@@ -637,15 +696,28 @@ export async function loadExplorePrompt(parsed: ParsedExploreArgs): Promise<stri
 }
 
 export async function exploreCommand(args: string[]): Promise<void> {
+  if (!args.includes('--help') && !args.includes('-h')) {
+    process.stderr.write(`${EXPLORE_DEPRECATION_NOTICE}\n`);
+  }
   if (process.env[EXPLORE_ACTIVE_ENV] === '1') {
     throw new Error('[explore] refusing to launch nested omx explore from an active explore run.');
+  }
+  if (args.some(isHelpArg)) {
+    process.stdout.write(`${EXPLORE_USAGE}\n`);
+    return;
   }
   const parsed = parseExploreArgs(args);
   const prompt = await loadExplorePrompt(parsed);
   const cwd = process.cwd();
-  const exploreEnv = resolveExploreEnv(cwd, process.env);
+  const exploreEnv = resolveExploreEnv(cwd, {
+    ...process.env,
+    ...(parsed.verbose ? { OMX_EXPLORE_VERBOSE: '1' } : {}),
+    ...(parsed.json ? { OMX_EXPLORE_JSON: '1' } : {}),
+  });
+  const startedAt = Date.now();
   const localFastPath = await resolveExploreLocalFastPath(prompt, cwd);
   if (localFastPath) {
+    emitExploreTelemetry({ backend: 'local-fast-path', reason: `${localFastPath.kind} lookup`, elapsedMs: Date.now() - startedAt }, exploreEnv);
     if (localFastPath.kind === 'file') {
       process.stdout.write([
         `[omx explore] local fast-path used (file lookup).`,
@@ -665,6 +737,7 @@ export async function exploreCommand(args: string[]): Promise<void> {
   const sparkShellRoute = resolveExploreSparkShellRoute(prompt);
   if (sparkShellRoute) {
     try {
+      emitExploreTelemetry({ backend: 'sparkshell', reason: sparkShellRoute.reason, elapsedMs: Date.now() - startedAt }, exploreEnv);
       await runExploreViaSparkShell(sparkShellRoute, exploreEnv);
       return;
     } catch (error) {
@@ -673,6 +746,7 @@ export async function exploreCommand(args: string[]): Promise<void> {
     }
   }
 
+  emitExploreTelemetry({ backend: 'explore-harness', reason: sparkShellRoute ? 'sparkshell-fallback' : 'default', elapsedMs: Date.now() - startedAt }, exploreEnv);
   const packageRoot = getPackageRoot();
   assertBuiltinExploreHarnessSupported(process.platform, exploreEnv);
   const harness = await resolveExploreHarnessCommandWithHydration(packageRoot, exploreEnv);

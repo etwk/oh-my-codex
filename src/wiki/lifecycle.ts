@@ -4,7 +4,7 @@
 
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
-import { codexHome, omxProjectMemoryPath } from '../utils/paths.js';
+import { codexHome, resolveProjectMemoryPath } from '../utils/paths.js';
 import {
   appendLogUnsafe,
   getWikiDir,
@@ -177,7 +177,7 @@ export function onPostCompact(data: { cwd?: string }): { additionalContext?: str
       additionalContext: [
         '[OMX Wiki PostCompact Nudge]',
         'Review the compaction artifacts and write durable findings to repository `omx_wiki/` when they would help future agents.',
-        'Use wiki_ingest or omx wiki add for decisions, architecture notes, debugging findings, environment facts, and session-log summaries worth committing.',
+        'Use `omx wiki wiki_ingest --input <json> --json` or `omx wiki wiki_add --input <json> --json` for decisions, architecture notes, debugging findings, environment facts, and session-log summaries worth committing.',
       ].join('\n'),
     };
   } catch {
@@ -187,8 +187,8 @@ export function onPostCompact(data: { cwd?: string }): { additionalContext?: str
 
 function feedProjectMemory(root: string): void {
   try {
-    const projectMemoryPath = omxProjectMemoryPath(root);
-    if (!existsSync(projectMemoryPath)) return;
+    const projectMemoryPath = resolveProjectMemoryPath(root);
+    if (!projectMemoryPath || !existsSync(projectMemoryPath)) return;
 
     const parsed = JSON.parse(readFileSync(projectMemoryPath, 'utf8')) as Record<string, unknown>;
     const existing = readPage(root, 'environment.md');

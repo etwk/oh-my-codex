@@ -14,7 +14,13 @@ export function resolveCanonicalTeamStateRoot(
   if (typeof explicit === 'string' && explicit.trim() !== '') {
     return resolve(leaderCwd, explicit.trim());
   }
-  return resolve(omxStateDir(leaderCwd));
+
+  const boxedRoot = env.OMX_ROOT || env.OMX_STATE_ROOT;
+  if (typeof boxedRoot === 'string' && boxedRoot.trim() !== '') {
+    return resolve(leaderCwd, boxedRoot.trim(), '.omx', 'state');
+  }
+
+  return omxStateDir(leaderCwd);
 }
 
 export interface TeamWorkerIdentityRef {

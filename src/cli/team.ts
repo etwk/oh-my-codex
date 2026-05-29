@@ -11,8 +11,6 @@ import type { TeamEvent } from '../team/state.js';
 import { parseWorktreeMode, type WorktreeMode } from '../team/worktree.js';
 import { classifyTaskSize } from '../hooks/task-size-detector.js';
 import {
-  isApprovedExecutionContextReadyStatus,
-  isApprovedExecutionFollowupReadyStatus,
   readApprovedExecutionLaunchHintOutcome,
   type ApprovedExecutionLaunchHint,
   type ApprovedRepositoryContextSummary,
@@ -39,6 +37,11 @@ import {
   resolvePersistedApprovedTeamExecutionContinuityStateSync,
   type ApprovedTeamExecutionBinding,
 } from '../team/approved-execution.js';
+import {
+  buildUltragoalCheckpointGuidance,
+  readPersistedTeamUltragoalContext,
+  renderUltragoalCheckpointGuidanceText,
+} from '../team/ultragoal-context.js';
 import { resolveCodexHomeForLaunch } from './codex-home.js';
 
 interface TeamCliOptions {
@@ -172,6 +175,23 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
     && existingTeamState.team_state_root.trim() !== ''
     ? existingTeamState.team_state_root.trim()
     : undefined;
+  const persistedTask = typeof existingTeamState?.task_description === 'string'
+    ? existingTeamState.task_description.trim()
+    : typeof existingTeamState?.task === 'string'
+      ? existingTeamState.task.trim()
+      : '';
+  const persistedWorkerCount = typeof existingTeamState?.agent_count === 'number'
+    ? existingTeamState.agent_count
+    : typeof existingTeamState?.workerCount === 'number'
+      ? existingTeamState.workerCount
+      : null;
+  const persistedAgentType = typeof existingTeamState?.agentType === 'string'
+    && existingTeamState.agentType.trim() !== ''
+    ? existingTeamState.agentType.trim()
+    : undefined;
+  const persistedLinkedRalph = typeof existingTeamState?.linkedRalph === 'boolean'
+    ? existingTeamState.linkedRalph
+    : undefined;
   let approvedHint: ApprovedExecutionLaunchHint | null = null;
 
   if (persistedTeamName !== '') {
@@ -192,38 +212,25 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
       throw new Error(`approved_execution_binding_stale:${continuity.binding.prd_path}:${continuity.binding.task}`);
     }
     if (continuity.status === 'valid') {
-      if (!isApprovedExecutionFollowupReadyStatus(continuity.approvedHint.contextPackStatus)) {
-        throw new Error(
-          `approved_execution_binding_nonready:${continuity.approvedHint.contextPackStatus}:${continuity.binding.prd_path}:${continuity.binding.task}`,
-        );
-      }
       approvedHint = continuity.approvedHint;
     }
   }
 
   if (!approvedHint) {
-    const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team');
+    const approvedHintOutcome = readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      ...(persistedTask !== '' ? { task: persistedTask } : {}),
+      ...(persistedWorkerCount != null ? { workerCount: persistedWorkerCount } : {}),
+      ...(persistedAgentType ? { agentType: persistedAgentType } : {}),
+      ...(persistedLinkedRalph != null ? { linkedRalph: persistedLinkedRalph } : {}),
+    });
     if (approvedHintOutcome.status === 'ambiguous') {
       throw new Error('approved_execution_hint_ambiguous:team');
     }
     if (approvedHintOutcome.status !== 'resolved') return null;
-    if (!isApprovedExecutionFollowupReadyStatus(approvedHintOutcome.hint.contextPackStatus)) {
-      throw new Error(`approved_execution_hint_nonready:team:${approvedHintOutcome.hint.contextPackStatus}`);
-    }
     approvedHint = approvedHintOutcome.hint;
   }
 
-  const persistedTask = typeof existingTeamState?.task_description === 'string'
-    ? existingTeamState.task_description
-    : typeof existingTeamState?.task === 'string'
-      ? existingTeamState.task
-      : null;
-  const persistedWorkerCount = typeof existingTeamState?.agent_count === 'number'
-    ? existingTeamState.agent_count
-    : typeof existingTeamState?.workerCount === 'number'
-      ? existingTeamState.workerCount
-      : null;
-  if (persistedTask && persistedWorkerCount && persistedTask.trim() === approvedHint.task.trim()) {
+  if (persistedTask !== '' && persistedWorkerCount && persistedTask === approvedHint.task.trim()) {
     return {
       task: persistedTask,
       workerCount: persistedWorkerCount,
@@ -242,6 +249,23 @@ function resolveApprovedTeamFollowupContext(cwd: string, task: string): TeamFoll
     explicitAgentType: approvedHint.agentType != null,
     approvedHint,
   };
+}
+
+function buildExplicitOmxTeamLaunchCommand(
+  task: string,
+  workerCount: number,
+  explicitWorkerCount: boolean,
+  agentType: string,
+  explicitAgentType: boolean,
+): string | null {
+  if (!explicitWorkerCount) {
+    return null;
+  }
+
+  const countToken = explicitAgentType
+    ? `${workerCount}:${agentType}`
+    : String(workerCount);
+  return `omx team ${countToken} ${JSON.stringify(task)}`;
 }
 
 const MIN_WORKER_COUNT = 1;
@@ -860,31 +884,42 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     }
   }
 
+  const explicitApprovedCommand = followupContext == null
+    ? buildExplicitOmxTeamLaunchCommand(
+      effectiveTask,
+      workerCount,
+      explicitWorkerCount,
+      agentType,
+      explicitAgentType,
+    )
+    : null;
+  const exactCommandHintOutcome = explicitApprovedCommand
+    ? readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      task: effectiveTask,
+      command: explicitApprovedCommand,
+    })
+    : null;
   const approvedHintOutcome = followupContext
     ? null
-    : readApprovedExecutionLaunchHintOutcome(cwd, 'team', { task: effectiveTask });
+    : exactCommandHintOutcome && exactCommandHintOutcome.status !== 'absent'
+      ? exactCommandHintOutcome
+    : readApprovedExecutionLaunchHintOutcome(cwd, 'team', {
+      task: effectiveTask,
+      workerCount,
+      ...(explicitAgentType ? { agentType } : {}),
+      linkedRalph: false,
+    });
   const approvedHint = followupContext?.approvedHint
-    ?? (approvedHintOutcome?.status === 'resolved' && approvedHintOutcome.hint.contextPackStatus !== 'missing-baseline'
-      ? approvedHintOutcome.hint
-      : null);
-  const followupReadyApprovedHint = approvedHint && isApprovedExecutionFollowupReadyStatus(approvedHint.contextPackStatus)
-    ? approvedHint
-    : null;
-  const contextReadyApprovedHint = followupReadyApprovedHint
-    && isApprovedExecutionContextReadyStatus(followupReadyApprovedHint.contextPackStatus)
-    ? followupReadyApprovedHint
-    : null;
-  const matchesApprovedLaunchHint = followupReadyApprovedHint?.task.trim() === effectiveTask.trim()
-    && (followupReadyApprovedHint.workerCount == null || followupReadyApprovedHint.workerCount === workerCount)
-    && (followupReadyApprovedHint.agentType == null || followupReadyApprovedHint.agentType === agentType);
+    ?? (approvedHintOutcome?.status === 'resolved' ? approvedHintOutcome.hint : null);
+  const matchesApprovedLaunchHint = followupContext == null
+    && approvedHint?.task.trim() === effectiveTask.trim()
+    && (approvedHint.workerCount == null || approvedHint.workerCount === workerCount)
+    && (approvedHint.agentType == null || approvedHint.agentType === agentType)
+    && Boolean(approvedHint.linkedRalph) === false;
   const allowRepoAwareDagHandoff = followupContext != null || matchesApprovedLaunchHint;
-  const dagFallbackReason = followupContext == null
-    && approvedHintOutcome?.status === 'resolved'
-    && !isApprovedExecutionFollowupReadyStatus(approvedHintOutcome.hint.contextPackStatus)
-    ? `context_pack_not_followup_ready:${approvedHintOutcome.hint.contextPackStatus}`
-    : undefined;
+  const dagFallbackReason = undefined;
   const approvedRepositoryContextSummary = allowRepoAwareDagHandoff
-    ? contextReadyApprovedHint?.repositoryContextSummary
+    ? approvedHint?.repositoryContextSummary
     : undefined;
 
   const teamName = sanitizeTeamName(slugifyTask(effectiveTask));
@@ -899,8 +934,8 @@ export function parseTeamArgs(args: string[], cwd: string = process.cwd()): Pars
     allowRepoAwareDagHandoff,
     ...(dagFallbackReason ? { dagFallbackReason } : {}),
     ...(approvedRepositoryContextSummary ? { approvedRepositoryContextSummary } : {}),
-    ...(allowRepoAwareDagHandoff && contextReadyApprovedHint
-      ? { approvedExecution: buildApprovedTeamExecutionBinding(contextReadyApprovedHint) }
+    ...(allowRepoAwareDagHandoff && approvedHint
+      ? { approvedExecution: buildApprovedTeamExecutionBinding(approvedHint) }
       : {}),
   };
 }
@@ -1442,6 +1477,14 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
     const modelInspect = parseStatusModelInspect(teamArgs.slice(2));
     const config = await readTeamConfig(resolvedName, cwd);
     const paneStatus = await readTeamPaneStatus(config, cwd, snapshot, tailLines);
+    const ultragoalContext = await readPersistedTeamUltragoalContext(
+      resolvedName,
+      config?.leader_cwd ?? cwd,
+      config?.team_state_root ?? undefined,
+    );
+    const ultragoalCheckpointGuidance = ultragoalContext
+      ? buildUltragoalCheckpointGuidance(ultragoalContext)
+      : null;
     if (wantsJson) {
       console.log(JSON.stringify({
         ...buildJsonBase(),
@@ -1468,6 +1511,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
         },
         performance: snapshot.performance ?? null,
         panes: paneStatus,
+        ...(ultragoalCheckpointGuidance
+          ? { ultragoal_checkpoint_guidance: ultragoalCheckpointGuidance }
+          : {}),
       }));
       return;
     }
@@ -1487,6 +1533,9 @@ export async function teamCommand(args: string[], _options: TeamCliOptions = {})
       console.log(
         `monitor_perf_ms: total=${snapshot.performance.total_ms} list=${snapshot.performance.list_tasks_ms} workers=${snapshot.performance.worker_scan_ms} mailbox=${snapshot.performance.mailbox_delivery_ms}`
       );
+    }
+    for (const line of renderUltragoalCheckpointGuidanceText(ultragoalContext)) {
+      console.log(line);
     }
     renderTeamPaneStatus(paneStatus, modelInspect, tailLines);
     return;

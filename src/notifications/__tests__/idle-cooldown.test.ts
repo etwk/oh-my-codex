@@ -24,6 +24,23 @@ function makeTmpStateDir(): string {
   return dir;
 }
 
+let previousCodexHome: string | undefined;
+let isolatedCodexHome: string | undefined;
+
+beforeEach(() => {
+  previousCodexHome = process.env.CODEX_HOME;
+  isolatedCodexHome = makeTmpStateDir();
+  process.env.CODEX_HOME = isolatedCodexHome;
+});
+
+afterEach(() => {
+  if (typeof previousCodexHome === 'string') process.env.CODEX_HOME = previousCodexHome;
+  else delete process.env.CODEX_HOME;
+  if (isolatedCodexHome) rmSync(isolatedCodexHome, { recursive: true, force: true });
+  previousCodexHome = undefined;
+  isolatedCodexHome = undefined;
+});
+
 describe('getIdleNotificationCooldownSeconds', () => {
   afterEach(() => {
     delete process.env.OMX_IDLE_COOLDOWN_SECONDS;

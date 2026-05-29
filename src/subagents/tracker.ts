@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { getBaseStateDir } from '../state/paths.js';
 
 export const SUBAGENT_TRACKING_SCHEMA_VERSION = 1;
 export const DEFAULT_SUBAGENT_ACTIVE_WINDOW_MS = 120_000;
@@ -10,9 +11,12 @@ export interface TrackedSubagentThread {
   kind: 'leader' | 'subagent';
   first_seen_at: string;
   last_seen_at: string;
+  completed_at?: string;
   last_turn_id?: string;
+  last_completed_turn_id?: string;
   turn_count: number;
   mode?: string;
+  completion_source?: string;
 }
 
 export interface TrackedSubagentSession {
@@ -33,6 +37,8 @@ export interface RecordSubagentTurnInput {
   turnId?: string;
   timestamp?: string;
   mode?: string;
+  completed?: boolean;
+  completionSource?: string;
 }
 
 export interface SubagentSessionSummary {
@@ -45,7 +51,7 @@ export interface SubagentSessionSummary {
 }
 
 export function subagentTrackingPath(cwd: string): string {
-  return join(cwd, '.omx', 'state', 'subagent-tracking.json');
+  return join(getBaseStateDir(cwd), 'subagent-tracking.json');
 }
 
 export function createSubagentTrackingState(): SubagentTrackingState {
@@ -88,10 +94,17 @@ export function normalizeSubagentTrackingState(input: unknown): SubagentTracking
         ...(typeof candidate.last_turn_id === 'string' && candidate.last_turn_id.trim().length > 0
           ? { last_turn_id: candidate.last_turn_id }
           : {}),
+        ...(typeof candidate.completed_at === 'string' && candidate.completed_at.trim().length > 0
+          ? { completed_at: candidate.completed_at }
+          : {}),
+        ...(typeof candidate.last_completed_turn_id === 'string' && candidate.last_completed_turn_id.trim().length > 0
+          ? { last_completed_turn_id: candidate.last_completed_turn_id }
+          : {}),
         turn_count: typeof candidate.turn_count === 'number' && Number.isFinite(candidate.turn_count) && candidate.turn_count > 0
           ? candidate.turn_count
           : 1,
         ...(typeof candidate.mode === 'string' && candidate.mode.trim().length > 0 ? { mode: candidate.mode } : {}),
+        ...(typeof candidate.completion_source === 'string' && candidate.completion_source.trim().length > 0 ? { completion_source: candidate.completion_source } : {}),
       };
     }
 
@@ -130,7 +143,7 @@ export async function readSubagentTrackingState(cwd: string): Promise<SubagentTr
 export async function writeSubagentTrackingState(cwd: string, state: SubagentTrackingState): Promise<string> {
   const normalized = normalizeSubagentTrackingState(state);
   const path = subagentTrackingPath(cwd);
-  await mkdir(join(cwd, '.omx', 'state'), { recursive: true });
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${JSON.stringify(normalized, null, 2)}\n`);
   return path;
 }
@@ -160,6 +173,13 @@ export function recordSubagentTurn(
     last_seen_at: timestamp,
     turn_count: (existingThread?.turn_count ?? 0) + 1,
     ...(input.turnId?.trim() ? { last_turn_id: input.turnId.trim() } : existingThread?.last_turn_id ? { last_turn_id: existingThread.last_turn_id } : {}),
+    ...(input.completed
+      ? {
+          completed_at: timestamp,
+          ...(input.turnId?.trim() ? { last_completed_turn_id: input.turnId.trim() } : {}),
+          ...(input.completionSource?.trim() ? { completion_source: input.completionSource.trim() } : {}),
+        }
+      : {}),
     ...(input.mode?.trim() ? { mode: input.mode.trim() } : existingThread?.mode ? { mode: existingThread.mode } : {}),
   };
 
@@ -211,6 +231,7 @@ export function summarizeSubagentSession(
   const activeSubagentThreadIds = allSubagentThreadIds.filter((threadId) => {
     const thread = session.threads[threadId];
     if (!thread) return false;
+    if (thread.completed_at) return false;
     const seenAt = Date.parse(thread.last_seen_at);
     if (!Number.isFinite(seenAt)) return false;
     return nowMs - seenAt <= activeWindowMs;
