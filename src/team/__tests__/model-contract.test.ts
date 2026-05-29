@@ -162,7 +162,9 @@ describe('team model contract', () => {
   it('maps worker roles to default reasoning effort tiers', () => {
     assert.equal(resolveAgentReasoningEffort('explore'), 'low');
     assert.equal(resolveAgentReasoningEffort('executor'), 'medium');
-    assert.equal(resolveAgentReasoningEffort('architect'), 'high');
+    assert.equal(resolveAgentReasoningEffort('architect'), 'xhigh');
+    assert.equal(resolveAgentReasoningEffort('code-reviewer'), 'xhigh');
+    assert.equal(resolveAgentReasoningEffort('critic'), 'xhigh');
     assert.equal(resolveAgentReasoningEffort('does-not-exist'), undefined);
   });
 
@@ -176,7 +178,7 @@ describe('team model contract', () => {
       }));
 
       assert.equal(resolveAgentReasoningEffort('architect', codexHome), 'xhigh');
-      assert.equal(resolveAgentReasoningEffort('critic', codexHome), 'high');
+      assert.equal(resolveAgentReasoningEffort('verifier', codexHome), 'high');
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }

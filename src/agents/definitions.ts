@@ -7,7 +7,7 @@
 export interface AgentDefinition {
   name: string;
   description: string;
-  reasoningEffort: 'low' | 'medium' | 'high';
+  reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh';
   posture: 'frontier-orchestrator' | 'deep-worker' | 'fast-lane';
   modelClass: 'frontier' | 'standard' | 'fast';
   routingRole: 'leader' | 'specialist' | 'executor';
@@ -74,7 +74,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'architect': {
     name: 'architect',
     description: 'System design, boundaries, interfaces, long-horizon tradeoffs',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -158,7 +158,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'code-reviewer': {
     name: 'code-reviewer',
     description: 'Comprehensive review across all concerns',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
@@ -346,7 +346,7 @@ export const AGENT_DEFINITIONS: Record<string, AgentDefinition> = {
   'critic': {
     name: 'critic',
     description: 'Plan/design critical challenge and review',
-    reasoningEffort: 'high',
+    reasoningEffort: 'xhigh',
     posture: 'frontier-orchestrator',
     modelClass: 'frontier',
     routingRole: 'leader',
